@@ -1343,11 +1343,15 @@ class TrajectoryVisualizer:
 
         if gt_result['position'] is not None:
             gt_pos = np.array(gt_result['position'])
+            rmse = gt_result.get('rmse', None)
+            rmse_text = f"{rmse*1000:.2f} mm" if rmse is not None else "N/A"
             print(f"GT位置 (PointCloud Fit): [{gt_pos[0]:7.4f}, {gt_pos[1]:7.4f}, {gt_pos[2]:7.4f}] m")
-            print(f"GT拟合RMSE: {gt_result['rmse']*1000:.2f} mm | inlier/cluster/total = "
+            print(f"GT拟合RMSE: {rmse_text} | inlier/cluster/total = "
                   f"{gt_result['inlier_points']}/{gt_result['cluster_points']}/{gt_result['total_points']}")
             if gt_result.get('icp_fitness') is not None:
-                print(f"ICP质量: fitness={gt_result['icp_fitness']:.4f}, inlier_rmse={gt_result.get('icp_inlier_rmse', 0.0)*1000:.2f} mm")
+                icp_inlier_rmse = gt_result.get('icp_inlier_rmse', None)
+                icp_inlier_rmse_text = f"{icp_inlier_rmse*1000:.2f} mm" if icp_inlier_rmse is not None else "N/A"
+                print(f"ICP质量: fitness={gt_result['icp_fitness']:.4f}, inlier_rmse={icp_inlier_rmse_text}")
         else:
             print(f"GT位置 (PointCloud Fit): None")
         
@@ -1729,10 +1733,14 @@ class TrajectoryVisualizer:
 
                         if gt_result['position'] is not None:
                             gt_pos = np.array(gt_result['position'])
+                            rmse = gt_result.get('rmse', None)
+                            rmse_text = f"{rmse*1000:.2f} mm" if rmse is not None else "N/A"
                             print(f"GT位置 (PointCloud Fit): [{gt_pos[0]:7.4f}, {gt_pos[1]:7.4f}, {gt_pos[2]:7.4f}] m")
-                            print(f"GT拟合RMSE: {gt_result['rmse']*1000:.2f} mm ")
+                            print(f"GT拟合RMSE: {rmse_text}")
                             if gt_result.get('icp_fitness') is not None:
-                                print(f"ICP质量: fitness={gt_result['icp_fitness']:.4f}, inlier_rmse={gt_result.get('icp_inlier_rmse', 0.0)*1000:.2f} mm")
+                                icp_inlier_rmse = gt_result.get('icp_inlier_rmse', None)
+                                icp_inlier_rmse_text = f"{icp_inlier_rmse*1000:.2f} mm" if icp_inlier_rmse is not None else "N/A"
+                                print(f"ICP质量: fitness={gt_result['icp_fitness']:.4f}, inlier_rmse={icp_inlier_rmse_text}")
                         else:
                             print(f"GT位置 (PointCloud Fit): None")
                         

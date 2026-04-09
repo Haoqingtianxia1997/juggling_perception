@@ -175,6 +175,12 @@ class BallTrackingNode(Node):
                 f"Invalid tracker.trajectory_coord_frame={self.trajectory_coord_frame}, fallback to 'body'"
             )
             self.trajectory_coord_frame = 'body'
+
+        # === Ground Truth Pose 订阅与时间同步配置 ===
+        self.gt_pose_topic = str(runtime_cfg.get('gt_pose_topic', '/juggling_ball_1/pose'))
+        self.sync_slop = 0.001  # 与RGB/Depth保持一致：1ms时间容差
+        self.latest_synced_gt_msg = None
+        self._gt_pose_unknown_frame_warned = False
         
         # === 地面高度阈值 ===
         self.ground_z_threshold = float(
@@ -243,14 +249,31 @@ class BallTrackingNode(Node):
             Image,
             self.depth_topic
         )
-        
-        # 使用近似时间同步器（允许5ms的时间差）
-        self.sync = message_filters.ApproximateTimeSynchronizer(
-            [rgb_sub, depth_sub],
-            queue_size=10,
-            slop=0.001  # 1ms 时间容差
-        )
-        self.sync.registerCallback(self.images_callback)
+
+        # 当GT话题存在时，直接使用三路时间同步；否则回退到RGB+Depth两路同步。
+        topic_names = {name for name, _ in self.get_topic_names_and_types()}
+        self.gt_pose_sync_enabled = self.gt_pose_topic in topic_names
+        if self.gt_pose_sync_enabled:
+            gt_sub = message_filters.Subscriber(self, PoseStamped, self.gt_pose_topic)
+            self.sync = message_filters.ApproximateTimeSynchronizer(
+                [rgb_sub, depth_sub, gt_sub],
+                queue_size=10,
+                slop=self.sync_slop
+            )
+            self.sync.registerCallback(self.images_callback_with_gt)
+            self.get_logger().info(
+                f"GT pose sync enabled: topic={self.gt_pose_topic}, slop={self.sync_slop:.3f}s"
+            )
+        else:
+            self.sync = message_filters.ApproximateTimeSynchronizer(
+                [rgb_sub, depth_sub],
+                queue_size=10,
+                slop=self.sync_slop
+            )
+            self.sync.registerCallback(self.images_callback)
+            self.get_logger().warn(
+                f"GT topic not found at startup: {self.gt_pose_topic}, running RGB+Depth sync only"
+            )
         
         # 订阅 world_model_prediction
         self.world_model_pred_sub = self.create_subscription(
@@ -305,12 +328,19 @@ class BallTrackingNode(Node):
         #     self.get_logger().info("Visualization enabled - Press 'q' to quit")
         
     def images_callback(self, rgb_msg, depth_msg):
+        self._handle_synced_images(rgb_msg, depth_msg, gt_msg=None)
+
+    def images_callback_with_gt(self, rgb_msg, depth_msg, gt_msg):
+        self._handle_synced_images(rgb_msg, depth_msg, gt_msg=gt_msg)
+
+    def _handle_synced_images(self, rgb_msg, depth_msg, gt_msg=None):
         """
-        同步接收 RGB 和深度图像（保证时间对齐）
+        同步接收图像（可选包含GT），并交给追踪主流程。
         
         Args:
             rgb_msg: RGB 图像消息
             depth_msg: 深度图像消息
+            gt_msg: GT pose消息（可选）
         """
         # 处理 RGB 图像
         cv_image = self.bridge.imgmsg_to_cv2(rgb_msg, desired_encoding='bgr8')
@@ -350,6 +380,7 @@ class BallTrackingNode(Node):
         self.latest_rgb = cv_image_masked
         self.latest_depth = cv_depth
         self.latest_image_timestamp = rgb_msg.header.stamp  # 保存时间戳用于marker同步
+        self.latest_synced_gt_msg = gt_msg
         # 直接在图像回调中处理追踪（确保处理与图像同步）
         self.process_tracking()
         
@@ -360,6 +391,58 @@ class BallTrackingNode(Node):
             self.latest_base_pos = np.array([msg.data[0], msg.data[1], msg.data[2]])
         else:
             self.latest_base_pos = np.array([0.0, 0.0, 0.0])
+
+    @staticmethod
+    def _infer_pose_frame_kind(frame_id):
+        """根据header.frame_id推断位姿所属坐标系类型：world/body。"""
+        fid = (frame_id or '').lower()
+        if any(key in fid for key in ('world', 'map', 'odom')):
+            return 'world'
+        if any(key in fid for key in ('imu_link', 'base_link', 'base', 'body')):
+            return 'body'
+        return None
+
+    def _get_gt_from_synced_msg(self, base_rot, base_pos):
+        """从已时间同步的GT消息提取位置并转换到轨迹坐标系。"""
+        msg = self.latest_synced_gt_msg
+        if msg is None:
+            return None
+
+        best_pos = np.array([
+            msg.pose.position.x,
+            msg.pose.position.y,
+            msg.pose.position.z,
+        ], dtype=np.float64)
+        best_frame_id = (msg.header.frame_id or '').strip().lower()
+
+        src_kind = self._infer_pose_frame_kind(best_frame_id)
+        if src_kind is None:
+            if not self._gt_pose_unknown_frame_warned:
+                self.get_logger().warn(
+                    f"Unknown GT frame_id='{best_frame_id}', assume world frame for conversion"
+                )
+                self._gt_pose_unknown_frame_warned = True
+            src_kind = 'world'
+
+        if src_kind == 'world':
+            pos_world = best_pos
+            pos_body = base_rot.T @ (pos_world - base_pos)
+        else:
+            pos_body = best_pos
+            pos_world = base_pos + base_rot @ pos_body
+
+        if self.trajectory_coord_frame == 'world':
+            pos_traj = pos_world
+        else:
+            pos_traj = pos_body
+
+        stamp = msg.header.stamp
+        stamp_sec = float(stamp.sec) + float(stamp.nanosec) * 1e-9 if hasattr(stamp, 'sec') and hasattr(stamp, 'nanosec') else None
+
+        return {
+            'position': pos_traj,
+            'stamp_sec': float(stamp_sec) if stamp_sec is not None else None,
+        }
             
     def get_robot_imu_data(self):
         """
@@ -473,6 +556,7 @@ class BallTrackingNode(Node):
         
 
         # 预测步长优先使用前后两帧时间差；无有效时间差时回退固定 dt
+        current_time = time.time()
         predict_time_sec = None
         if self.latest_image_timestamp is not None:
             stamp = self.latest_image_timestamp
@@ -555,6 +639,7 @@ class BallTrackingNode(Node):
             self.ball_tracker.predict_all(
                 ground_z_threshold=self.ground_z_threshold,
                 dt=dt_dynamic,
+                base_site_rot=base_rot,
                 base_site_pos=base_pos,
             )
         
@@ -636,6 +721,7 @@ class BallTrackingNode(Node):
         
         # === 记录轨迹数据 ===
         if self.enable_trajectory_recording:
+            synced_gt = self._get_gt_from_synced_msg(base_rot, base_pos)
             self.record_trajectory_frame(
                 has_detection,
                 actually_updated,
@@ -645,7 +731,8 @@ class BallTrackingNode(Node):
                 base_pos,
                 rgb_bgr,
                 depth_array,
-                current_time
+                current_time,
+                synced_gt=synced_gt
             )
             
         # === 从 kf_obs_body 提取 catch_info ===
@@ -700,7 +787,7 @@ class BallTrackingNode(Node):
             self.get_logger().info(f"Tracking FPS: {fps:.1f}")
             self.last_process_time = current_time
     
-    def record_trajectory_frame(self, has_detection, actually_updated, detection_results, detection_assignments, base_rot, base_pos, rgb_image, depth_image, current_time):
+    def record_trajectory_frame(self, has_detection, actually_updated, detection_results, detection_assignments, base_rot, base_pos, rgb_image, depth_image, current_time, synced_gt=None):
         """
         记录当前帧的轨迹数据，包括RGB和depth图像
         
@@ -714,6 +801,7 @@ class BallTrackingNode(Node):
             rgb_image: RGB图像（BGR格式）
             depth_image: 深度图像
             current_time: 当前时间
+            synced_gt: 当前图像时间戳匹配到的GT信息（已转换到trajectory坐标系）
         """
         
         # 为每个tracker记录数据
@@ -753,6 +841,11 @@ class BallTrackingNode(Node):
                             detection_pos = det_pos_body.tolist()
                 
                 if kf_data is not None:
+                    gt_for_tracker = None
+                    # 单GT场景：固定写入tracker 0
+                    if synced_gt is not None and tracker_id == 0:
+                        gt_for_tracker = synced_gt
+
                     # 当前轨迹的帧索引
                     frame_idx = len(self.trajectory_data[tracker_id])
                     
@@ -905,6 +998,13 @@ class BallTrackingNode(Node):
                     g_value = kf_data.get('gravity', None)
                     if g_enabled and g_value is not None:
                         frame_data['kf_g'] = float(g_value)
+
+                    # 若当前帧有GT时间同步结果，则直接写入gt_pos，供离线可视化直接读取
+                    if gt_for_tracker is not None:
+                        frame_data['gt_pos'] = gt_for_tracker['position'].tolist()
+                        frame_data['gt_pos_frame'] = self.trajectory_coord_frame
+                        if gt_for_tracker.get('stamp_sec') is not None:
+                            frame_data['gt_timestamp'] = float(gt_for_tracker['stamp_sec'])
 
                     self.trajectory_data[tracker_id].append(frame_data)
                     
@@ -1074,7 +1174,14 @@ class BallTrackingNode(Node):
             min_depth = np.percentile(valid_depth, 1)
             max_depth = np.percentile(valid_depth, 99)
             depth_clipped = np.clip(depth_array, min_depth, max_depth)
-            depth_normalized = ((depth_clipped - min_depth) / (max_depth - min_depth) * 255).astype(np.uint8)
+            depth_range = max_depth - min_depth
+            # 当有效深度范围过小或无效时，退化为全零图，避免除零/NaN告警
+            if (not np.isfinite(depth_range)) or depth_range <= 1e-9:
+                depth_normalized = np.zeros(depth_array.shape, dtype=np.uint8)
+            else:
+                depth_scaled = (depth_clipped - min_depth) / depth_range
+                depth_scaled = np.nan_to_num(depth_scaled, nan=0.0, posinf=1.0, neginf=0.0)
+                depth_normalized = np.clip(depth_scaled * 255.0, 0.0, 255.0).astype(np.uint8)
         else:
             depth_normalized = np.zeros(depth_array.shape, dtype=np.uint8)
         
