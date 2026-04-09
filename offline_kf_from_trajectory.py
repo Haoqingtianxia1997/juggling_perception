@@ -209,12 +209,12 @@ def run_one_trajectory(json_path: Path, tracker_params: dict[str, Any], predict_
     for i, fr in enumerate(frames):
         t_curr = float(t_rel[i])
         dt_curr = float(dt_to_prev[i]) if i < len(dt_to_prev) else dt_default
-        
+
         body_pos, body_rot = _parse_body_pose(fr)
         if body_pos is not None and body_rot is not None:
             last_body_pos = body_pos
             last_body_rot = body_rot
-            
+
         det_raw = fr.get("detection_pos", None)
         det = None
         if det_raw is not None:
