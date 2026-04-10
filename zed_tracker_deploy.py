@@ -178,7 +178,7 @@ class BallTrackingNode(Node):
 
         # === Ground Truth Pose 订阅与时间同步配置 ===
         self.gt_pose_topic = str(runtime_cfg.get('gt_pose_topic', '/juggling_ball_1/pose'))
-        self.sync_slop = 0.001  # 与RGB/Depth保持一致：1ms时间容差
+        self.sync_slop = 0.002 # 与RGB/Depth保持一致：1ms时间容差
         self.latest_synced_gt_msg = None
         self._gt_pose_unknown_frame_warned = False
         
@@ -257,7 +257,7 @@ class BallTrackingNode(Node):
             gt_sub = message_filters.Subscriber(self, PoseStamped, self.gt_pose_topic)
             self.sync = message_filters.ApproximateTimeSynchronizer(
                 [rgb_sub, depth_sub, gt_sub],
-                queue_size=10,
+                queue_size=5,
                 slop=self.sync_slop
             )
             self.sync.registerCallback(self.images_callback_with_gt)
@@ -267,7 +267,7 @@ class BallTrackingNode(Node):
         else:
             self.sync = message_filters.ApproximateTimeSynchronizer(
                 [rgb_sub, depth_sub],
-                queue_size=10,
+                queue_size=5,
                 slop=self.sync_slop
             )
             self.sync.registerCallback(self.images_callback)
@@ -639,7 +639,6 @@ class BallTrackingNode(Node):
             self.ball_tracker.predict_all(
                 ground_z_threshold=self.ground_z_threshold,
                 dt=dt_dynamic,
-                base_site_rot=base_rot,
                 base_site_pos=base_pos,
             )
         

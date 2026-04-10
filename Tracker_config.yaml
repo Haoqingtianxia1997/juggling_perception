@@ -169,9 +169,9 @@ tracker:
   # KalmanFilter3D 参数
   kalman:
     # 重力加速度 (m/s²)
-    g: 9.8
+    g: 9.775
     # 是否将重力 g 作为状态参与估计（state=[x,y,z,vx,vy,vz,g]）
-    enable_gravity_state_estimation: true
+    enable_gravity_state_estimation: false
     # g 状态过程噪声（随机游走标准差，单位 m/s^2 / sqrt(s)）
     gravity_state_process_noise: 0.0
     # g 状态初始标准差（单位 m/s^2）

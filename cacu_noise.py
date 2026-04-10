@@ -1575,6 +1575,160 @@ def _print_global_error_stats(
 		print(_format_stats_console_line(key, stats), flush=True)
 
 
+def _fit_global_gt_ballistic_params(json_files: list[Path]):
+	"""用全部轨迹 GT 联合拟合：共享重力 g，每条轨迹单独拟合初始位置/初始速度。"""
+	traj_samples = []
+	for js in json_files:
+		_, gt_points, _, times, _, _, _, _, _, _, _, _, _, _, _ = _load_detection_series(js)
+		if len(gt_points) == 0:
+			continue
+
+		gt = np.asarray(gt_points, dtype=float)
+		t = np.asarray(times, dtype=float)
+		valid = np.isfinite(t) & np.isfinite(gt).all(axis=1)
+		if int(np.sum(valid)) < 3:
+			continue
+
+		traj_samples.append(
+			{
+				"name": js.stem,
+				"t": t[valid],
+				"gt": gt[valid],
+			}
+		)
+
+	n = len(traj_samples)
+	if n == 0:
+		return None
+
+	# 变量布局: [x0,y0,z0,vx,vy,vz] * n + [beta]
+	# 其中 z = z0 + vz*t + beta*t^2, g = -2*beta
+	total_rows = int(sum(3 * s["t"].shape[0] for s in traj_samples))
+	total_cols = int(6 * n + 1)
+	A = np.zeros((total_rows, total_cols), dtype=float)
+	b = np.zeros((total_rows,), dtype=float)
+
+	r = 0
+	for j, sample in enumerate(traj_samples):
+		t = sample["t"]
+		p = sample["gt"]
+		base = 6 * j
+		for i in range(t.shape[0]):
+			ti = float(t[i])
+			xi, yi, zi = float(p[i, 0]), float(p[i, 1]), float(p[i, 2])
+
+			# x = x0 + vx*t
+			A[r, base + 0] = 1.0
+			A[r, base + 3] = ti
+			b[r] = xi
+			r += 1
+
+			# y = y0 + vy*t
+			A[r, base + 1] = 1.0
+			A[r, base + 4] = ti
+			b[r] = yi
+			r += 1
+
+			# z = z0 + vz*t + beta*t^2
+			A[r, base + 2] = 1.0
+			A[r, base + 5] = ti
+			A[r, -1] = ti * ti
+			b[r] = zi
+			r += 1
+
+	x, *_ = np.linalg.lstsq(A, b, rcond=None)
+	beta = float(x[-1])
+	g = float(-2.0 * beta)
+
+	traj_results = []
+	err_x = []
+	err_y = []
+	err_z = []
+	for j, sample in enumerate(traj_samples):
+		base = 6 * j
+		x0, y0, z0 = float(x[base + 0]), float(x[base + 1]), float(x[base + 2])
+		vx, vy, vz = float(x[base + 3]), float(x[base + 4]), float(x[base + 5])
+		t = sample["t"]
+		p = sample["gt"]
+
+		px = x0 + vx * t
+		py = y0 + vy * t
+		pz = z0 + vz * t + beta * (t ** 2)
+		ex = p[:, 0] - px
+		ey = p[:, 1] - py
+		ez = p[:, 2] - pz
+		err_x.append(ex)
+		err_y.append(ey)
+		err_z.append(ez)
+
+		traj_results.append(
+			{
+				"trajectory": sample["name"],
+				"num_points": int(t.shape[0]),
+				"p0": [x0, y0, z0],
+				"v0": [vx, vy, vz],
+				"v0_norm": float(np.linalg.norm([vx, vy, vz])),
+			}
+		)
+
+	err_x = np.concatenate(err_x) if err_x else np.asarray([], dtype=float)
+	err_y = np.concatenate(err_y) if err_y else np.asarray([], dtype=float)
+	err_z = np.concatenate(err_z) if err_z else np.asarray([], dtype=float)
+	v0_all = np.asarray([it["v0"] for it in traj_results], dtype=float)
+	v0_norm = np.linalg.norm(v0_all, axis=1) if v0_all.size > 0 else np.asarray([], dtype=float)
+
+	return {
+		"shared_gravity": g,
+		"num_trajectories": int(n),
+		"num_points_total": int(sum(s["t"].shape[0] for s in traj_samples)),
+		"rmse_xyz": {
+			"x": float(np.sqrt(np.mean(err_x ** 2))) if err_x.size > 0 else np.nan,
+			"y": float(np.sqrt(np.mean(err_y ** 2))) if err_y.size > 0 else np.nan,
+			"z": float(np.sqrt(np.mean(err_z ** 2))) if err_z.size > 0 else np.nan,
+		},
+		"v0_mean": [
+			float(np.mean(v0_all[:, 0])) if v0_all.size > 0 else np.nan,
+			float(np.mean(v0_all[:, 1])) if v0_all.size > 0 else np.nan,
+			float(np.mean(v0_all[:, 2])) if v0_all.size > 0 else np.nan,
+		],
+		"v0_norm_mean": float(np.mean(v0_norm)) if v0_norm.size > 0 else np.nan,
+		"v0_norm_std": float(np.std(v0_norm)) if v0_norm.size > 0 else np.nan,
+		"per_trajectory": traj_results,
+	}
+
+
+def _print_global_gt_ballistic_fit_result(result: dict | None):
+	if result is None:
+		print("\n===== 全局GT联合拟合（重力+初速度） =====")
+		print("可用GT点不足，无法拟合。", flush=True)
+		return
+
+	print("\n===== 全局GT联合拟合（重力+初速度） =====", flush=True)
+	print(
+		f"轨迹数={result['num_trajectories']}, GT点数={result['num_points_total']}, "
+		f"共享最优重力 g={result['shared_gravity']:.6f} m/s^2",
+		flush=True,
+	)
+	print(
+		"全局初速度均值 v0_mean="
+		f"[{result['v0_mean'][0]:+.6f}, {result['v0_mean'][1]:+.6f}, {result['v0_mean'][2]:+.6f}] m/s, "
+		f"|v0| mean={result['v0_norm_mean']:.6f}, std={result['v0_norm_std']:.6f}",
+		flush=True,
+	)
+	print(
+		f"GT拟合RMSE: x={result['rmse_xyz']['x']:.6f}, y={result['rmse_xyz']['y']:.6f}, z={result['rmse_xyz']['z']:.6f}",
+		flush=True,
+	)
+
+	for item in result.get("per_trajectory", []):
+		v0 = item["v0"]
+		print(
+			f"- {item['trajectory']}: v0=[{v0[0]:+.6f}, {v0[1]:+.6f}, {v0[2]:+.6f}] m/s, "
+			f"|v0|={item['v0_norm']:.6f}, n={item['num_points']}",
+			flush=True,
+		)
+
+
 def main():
 	parser = argparse.ArgumentParser(description="逐条绘制 trajectory_data 中每条轨迹的 detection 位置")
 	parser.add_argument(
@@ -1635,6 +1789,17 @@ def main():
 		f"z_degree={online_fit_cfg['online_fit_z_degree']}",
 		flush=True,
 	)
+
+	# 最开始先用全部轨迹 GT 做联合拟合，得到共享重力和每条轨迹最优初速度
+	global_gt_fit = _fit_global_gt_ballistic_params(json_files)
+	_print_global_gt_ballistic_fit_result(global_gt_fit)
+	if global_gt_fit is not None:
+		output_dir.mkdir(parents=True, exist_ok=True)
+		global_fit_out = output_dir / "global_gt_ballistic_fit.json"
+		with open(global_fit_out, "w", encoding="utf-8") as f:
+			json.dump(global_gt_fit, f, ensure_ascii=False, indent=2)
+		print(f"[已保存] {global_fit_out}", flush=True)
+
 	# 先计算并打印全局统计，再逐条出图
 	global_err, global_err_down = _collect_global_error_stats(json_files, args.fit_method, "gt")
 	_print_global_error_stats(

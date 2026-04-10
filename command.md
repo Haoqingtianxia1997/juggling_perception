@@ -22,7 +22,7 @@ apt install -y ros-humble-rmw-cyclonedds-cpp
 export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 ros2 launch zed_wrapper zed_camera.launch.py camera_model:=zed2 publish_tf:=false publish_map_tf:=false
 
-ros2 launch zed_wrapper zed_camera.launch.py   camera_model:=zed2   publish_tf:=true   publish_map_tf:=false   depth.publish_point_cloud:=true
+ros2 launch zed_wrapper zed_camera.launch.py   camera_model:=zed2   publish_tf:=false   publish_map_tf:=false   depth.publish_point_cloud:=true
 
 ```
 
@@ -47,6 +47,8 @@ ros2 topic echo /juggling_ball_1/pose
 ```bash
 ros2 run tf2_ros static_transform_publisher 0 0 0 -0.0185099 -0.0185099 -0.7068645 0.7068645 juggling_cam zed_camera_link
 
+#read tf transformation
+ros2 run tf2_ros tf2_echo juggling_cam zed_left_camera_optical_frame
 ```
 
 # get camera extrinsic
