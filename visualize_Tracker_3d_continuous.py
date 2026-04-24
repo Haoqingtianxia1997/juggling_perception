@@ -11,6 +11,7 @@ import open3d as o3d
 import cv2
 import argparse
 import yaml
+import time
 from pathlib import Path
 
 try:
@@ -1862,10 +1863,6 @@ class TrajectoryVisualizer:
                 vis.update_renderer()
             
             print("\n\n可视化结束")
-            # 每条轨迹可视化完成后，显示Detection-GT差值统计图
-            self.show_detection_gt_error_plots(start_frame=start_frame, end_frame=end_frame)
-            # 每条轨迹可视化完成后，显示KF-GT差值统计图
-            self.show_kf_gt_error_plots(start_frame=start_frame, end_frame=end_frame)
             return controller.switch_trajectory
         
         except KeyboardInterrupt:
@@ -1939,8 +1936,6 @@ def main():
                        help='点云X轴过滤阈值，保留 x <= x-max（米，默认1.0）')
     parser.add_argument('--hide-gt-marker', action='store_true',
                        help='隐藏拟合得到的Ground Truth位置标记（可在交互界面按G再次打开）')
-    parser.add_argument('--no-pre-stats', action='store_true',
-                       help='关闭可视化前的Detection-GT预统计输出')
     parser.add_argument('--add-gt-pos', action='store_true',
                        help='可开关：将拟合GT写入gt_pos字段并写回轨迹JSON文档（不覆盖detection_pos）')
     parser.add_argument('--gt-balls', type=int, default=None,
@@ -1970,6 +1965,386 @@ def main():
             viz.camera_to_body_transform = np.eye(4)
             viz.camera_to_body_transform[:3, :3] = camera_rotation_in_body
             viz.camera_to_body_transform[:3, 3] = [args.cam_forward, args.cam_lateral, args.cam_height]
+
+    def sort_json_files_by_time(json_paths):
+        """按轨迹起始时间排序（优先start_timestamp，缺失时回退到文件名）。"""
+        keyed = []
+        for p in json_paths:
+            start_ts = None
+            try:
+                with open(p, 'r') as f:
+                    meta = json.load(f)
+                if meta.get('start_timestamp', None) is not None:
+                    start_ts = float(meta['start_timestamp'])
+            except Exception:
+                start_ts = None
+            if start_ts is None:
+                start_ts = float('inf')
+            keyed.append((start_ts, p.name, p))
+
+        keyed.sort(key=lambda x: (x[0], x[1]))
+        return [item[2] for item in keyed]
+
+    def run_multi_trajectory_single_window(json_files):
+        """一个窗口内按时间戳对齐连续可视化所有轨迹。"""
+        if len(json_files) == 0:
+            print("错误: 没有可视化轨迹")
+            return
+
+        def _geometry_has_content(geom):
+            """避免向Open3D添加空几何体，防止AABB 0点警告。"""
+            try:
+                if isinstance(geom, o3d.geometry.PointCloud):
+                    return len(geom.points) > 0
+                if isinstance(geom, o3d.geometry.LineSet):
+                    return len(geom.points) > 0 and len(geom.lines) > 0
+                if isinstance(geom, o3d.geometry.TriangleMesh):
+                    return len(geom.vertices) > 0 and len(geom.triangles) > 0
+                return True
+            except Exception:
+                return False
+
+        # 为不同轨迹分配可区分颜色
+        palette = [
+            [1.0, 0.2, 0.2],
+            [0.2, 0.4, 1.0],
+            [1.0, 0.55, 0.1],
+            [0.6, 0.2, 0.9],
+            [0.1, 0.75, 0.75],
+            [0.5, 0.5, 0.5],
+        ]
+
+        def _color_for_tracker_id(tracker_id):
+            """固定tracker_id对应固定颜色。"""
+            try:
+                tid = int(tracker_id)
+            except Exception:
+                tid = 0
+            return palette[tid % len(palette)]
+
+        traj_states = []
+        for i, json_file in enumerate(json_files):
+            try:
+                viz = TrajectoryVisualizer(json_file)
+                configure_visualizer(viz)
+
+                frame_start = max(0, int(args.start))
+                frame_end = len(viz.frames) if args.end is None else min(len(viz.frames), int(args.end))
+                if frame_start >= frame_end:
+                    continue
+
+                start_timestamp = float(viz.trajectory.get('start_timestamp', 0.0))
+                valid_indices = list(range(frame_start, frame_end))
+                abs_times = []
+                for fi in valid_indices:
+                    fr = viz.frames[fi]
+                    rel_t = fr.get('relative_time', fi)
+                    abs_times.append(start_timestamp + float(rel_t))
+
+                traj_states.append({
+                    'viz': viz,
+                    'json_file': json_file,
+                    'indices': np.asarray(valid_indices, dtype=np.int32),
+                    'abs_times': np.asarray(abs_times, dtype=np.float64),
+                    'color': _color_for_tracker_id(viz.tracker_id)
+                })
+            except Exception as e:
+                print(f"警告: 跳过轨迹 {json_file.name}，初始化失败: {e}")
+
+        if len(traj_states) == 0:
+            print("错误: 没有可用于可视化的轨迹")
+            return
+
+        all_times = np.unique(np.concatenate([s['abs_times'] for s in traj_states]))
+        if all_times.size == 0:
+            print("错误: 未提取到有效时间戳")
+            return
+
+        print(f"\n单窗口连续可视化：{len(traj_states)} 条轨迹，{len(all_times)} 个对齐时间点")
+        print("控制按键：")
+        print("  Space         : 播放/暂停（默认暂停）")
+        print("  → / D         : 下一时间点（逐帧）")
+        print("  ← / A         : 上一时间点（逐帧）")
+        print("  X             : 切换X轴点云过滤")
+        print("  1             : 切换Detection球显示")
+        print("  2             : 切换KF球显示")
+        print("  G             : 切换Ground Truth位置显示")
+        print("  3             : 切换Detection轨迹线显示")
+        print("  4             : 切换GT轨迹线显示")
+        print("  Q / ESC       : 退出\n")
+
+        vis = o3d.visualization.VisualizerWithKeyCallback()
+        vis.create_window(window_name="Trajectory Viewer (All Aligned)", width=1400, height=800)
+
+        class Controller:
+            def __init__(self):
+                self.time_idx = 0
+                self.playing = False
+                self.should_update = True
+                self.should_exit = False
+                self.camera_initialized = False
+
+                # 保持原有显示逻辑开关
+                ref_viz = traj_states[0]['viz']
+                self.enable_x_filter = ref_viz.enable_x_filter
+                self.x_filter_threshold = ref_viz.x_filter_threshold
+                self.show_detection_sphere = ref_viz.show_detection_sphere
+                self.show_kf_sphere = ref_viz.show_kf_sphere
+                self.show_ground_truth_marker = ref_viz.show_ground_truth_marker
+                self.show_detection_trajectory = ref_viz.show_detection_trajectory
+                self.show_ground_truth_trajectory = ref_viz.show_ground_truth_trajectory
+
+        controller = Controller()
+
+        def _sync_flags_to_all_visualizers():
+            for st in traj_states:
+                vz = st['viz']
+                vz.enable_x_filter = controller.enable_x_filter
+                vz.x_filter_threshold = controller.x_filter_threshold
+                vz.show_detection_sphere = controller.show_detection_sphere
+                vz.show_kf_sphere = controller.show_kf_sphere
+                vz.show_ground_truth_marker = controller.show_ground_truth_marker
+                vz.show_detection_trajectory = controller.show_detection_trajectory
+                vz.show_ground_truth_trajectory = controller.show_ground_truth_trajectory
+
+        def key_toggle_play(_):
+            controller.playing = not controller.playing
+            print(f"\n[播放] {'继续' if controller.playing else '暂停'}")
+            return False
+
+        def key_next(_):
+            controller.playing = False
+            if controller.time_idx < len(all_times) - 1:
+                controller.time_idx += 1
+                controller.should_update = True
+            return False
+
+        def key_prev(_):
+            controller.playing = False
+            if controller.time_idx > 0:
+                controller.time_idx -= 1
+                controller.should_update = True
+            return False
+
+        def key_quit(_):
+            controller.should_exit = True
+            return False
+
+        def key_toggle_x_filter(_):
+            controller.enable_x_filter = not controller.enable_x_filter
+            print(f"\n[X过滤] {'ON' if controller.enable_x_filter else 'OFF'} (body_x <= {controller.x_filter_threshold:.2f}m)")
+            controller.should_update = True
+            return False
+
+        def key_toggle_detection_sphere(_):
+            controller.show_detection_sphere = not controller.show_detection_sphere
+            print(f"\n[Detection球] {'ON' if controller.show_detection_sphere else 'OFF'}")
+            controller.should_update = True
+            return False
+
+        def key_toggle_kf_sphere(_):
+            controller.show_kf_sphere = not controller.show_kf_sphere
+            print(f"\n[KF球] {'ON' if controller.show_kf_sphere else 'OFF'}")
+            controller.should_update = True
+            return False
+
+        def key_toggle_ground_truth(_):
+            controller.show_ground_truth_marker = not controller.show_ground_truth_marker
+            print(f"\n[GT位置] {'ON' if controller.show_ground_truth_marker else 'OFF'}")
+            controller.should_update = True
+            return False
+
+        def key_toggle_detection_trajectory(_):
+            controller.show_detection_trajectory = not controller.show_detection_trajectory
+            print(f"\n[Detection轨迹] {'ON' if controller.show_detection_trajectory else 'OFF'}")
+            controller.should_update = True
+            return False
+
+        def key_toggle_ground_truth_trajectory(_):
+            controller.show_ground_truth_trajectory = not controller.show_ground_truth_trajectory
+            print(f"\n[GT轨迹] {'ON' if controller.show_ground_truth_trajectory else 'OFF'}")
+            controller.should_update = True
+            return False
+
+        vis.register_key_callback(32, key_toggle_play)      # Space
+        vis.register_key_callback(262, key_next)            # Right
+        vis.register_key_callback(ord('D'), key_next)
+        vis.register_key_callback(ord('d'), key_next)
+        vis.register_key_callback(263, key_prev)            # Left
+        vis.register_key_callback(ord('A'), key_prev)
+        vis.register_key_callback(ord('a'), key_prev)
+        vis.register_key_callback(ord('Q'), key_quit)
+        vis.register_key_callback(256, key_quit)            # ESC
+        vis.register_key_callback(ord('X'), key_toggle_x_filter)
+        vis.register_key_callback(ord('x'), key_toggle_x_filter)
+        vis.register_key_callback(ord('1'), key_toggle_detection_sphere)
+        vis.register_key_callback(ord('2'), key_toggle_kf_sphere)
+        vis.register_key_callback(ord('G'), key_toggle_ground_truth)
+        vis.register_key_callback(ord('g'), key_toggle_ground_truth)
+        vis.register_key_callback(ord('3'), key_toggle_detection_trajectory)
+        vis.register_key_callback(ord('4'), key_toggle_ground_truth_trajectory)
+
+        geometries = []
+        step_interval = 1.0 / 30.0
+        last_step_time = time.time()
+
+        try:
+            while not controller.should_exit:
+                now = time.time()
+                if controller.playing and (now - last_step_time) >= step_interval:
+                    if controller.time_idx < len(all_times) - 1:
+                        controller.time_idx += 1
+                        controller.should_update = True
+                        last_step_time = now
+                    else:
+                        controller.should_exit = True
+                        continue
+
+                if controller.should_update:
+                    _sync_flags_to_all_visualizers()
+
+                    for g in geometries:
+                        vis.remove_geometry(g, reset_bounding_box=False)
+                    geometries.clear()
+
+                    t_cur = float(all_times[controller.time_idx])
+                    rendered_trackers = 0
+                    bbox_reset = (not controller.camera_initialized)
+
+                    for st in traj_states:
+                        vz = st['viz']
+                        abs_times = st['abs_times']
+                        idx_arr = st['indices']
+
+                        pos = int(np.searchsorted(abs_times, t_cur, side='right') - 1)
+                        if pos < 0:
+                            continue
+
+                        # 轨迹结束后不再继续显示该轨迹（球体与轨迹线都隐藏）
+                        if t_cur > float(abs_times[-1]):
+                            continue
+
+                        frame_idx = int(idx_arr[pos])
+                        frame = vz.frames[frame_idx]
+
+                        rgb_path = vz.image_dir / frame['rgb_file']
+                        depth_path = vz.image_dir / frame['depth_file']
+                        if (not rgb_path.exists()) or (not depth_path.exists()):
+                            continue
+
+                        rgb_image = cv2.imread(str(rgb_path))
+                        depth_array = np.load(str(depth_path))
+
+                        pcd = vz.create_point_cloud_from_depth(rgb_image, depth_array, frame=frame)
+                        pcd = vz.filter_point_cloud_by_x(pcd, frame=frame)
+                        gt_result = vz.get_or_compute_gt_result(frame_idx, frame=frame, pcd=pcd)
+
+                        pcd_ds = pcd.voxel_down_sample(voxel_size=0.01)
+                        if len(pcd_ds.points) > 0:
+                            pcd_ds.paint_uniform_color([0.75, 0.75, 0.75])
+                            geometries.append(pcd_ds)
+
+                        if rendered_trackers == 0:
+                            geometries.extend(vz.create_world_body_coordinate_frames(frame, size=0.2))
+
+                        color = st['color']
+                        kf_color = [max(0.0, c * 0.7) for c in color]
+
+                        if controller.show_detection_sphere and frame.get('detection_pos') is not None:
+                            geometries.append(
+                                vz.create_sphere_marker(
+                                    frame['detection_pos'],
+                                    color=color,
+                                    radius=0.025,
+                                    wireframe=False
+                                )
+                            )
+
+                        if controller.show_kf_sphere and frame.get('kf_pos') is not None:
+                            geometries.append(
+                                vz.create_sphere_marker(
+                                    frame['kf_pos'],
+                                    color=kf_color,
+                                    radius=vz.ball_radius,
+                                    wireframe=True
+                                )
+                            )
+
+                        if controller.show_ground_truth_marker and gt_result.get('position') is not None:
+                            geometries.append(
+                                vz.create_sphere_marker(
+                                    gt_result['position'],
+                                    color=[0.0, 0.7, 0.0],
+                                    radius=vz.ball_radius,
+                                    wireframe=False
+                                )
+                            )
+
+                        if controller.show_detection_trajectory:
+                            det_pts = []
+                            for hi in range(int(idx_arr[0]), frame_idx + 1):
+                                hf = vz.frames[hi]
+                                if hf.get('detection_pos') is not None:
+                                    det_pts.append(hf['detection_pos'])
+                            det_line = vz.create_trajectory_lineset(det_pts, color=color)
+                            if det_line is not None:
+                                geometries.append(det_line)
+
+                        if controller.show_ground_truth_trajectory:
+                            gt_pts = []
+                            for hi in range(int(idx_arr[0]), frame_idx + 1):
+                                hf = vz.frames[hi]
+                                gt_hist = vz.get_or_compute_gt_result(hi, frame=hf)
+                                if gt_hist.get('position') is not None:
+                                    gt_pts.append(gt_hist['position'])
+                            gt_line = vz.create_trajectory_lineset(gt_pts, color=[0.0, 0.6, 0.0])
+                            if gt_line is not None:
+                                geometries.append(gt_line)
+
+                        rendered_trackers += 1
+
+                    for g in geometries:
+                        if not _geometry_has_content(g):
+                            continue
+                        vis.add_geometry(g, reset_bounding_box=bbox_reset)
+                        bbox_reset = False
+
+                    if (not controller.camera_initialized) and len(geometries) > 0:
+                        view_control = vis.get_view_control()
+                        view_control.set_front([-300, 100, 50])
+                        view_control.set_up([0, 0, 1])
+                        view_control.set_zoom(0.4)
+                        controller.camera_initialized = True
+
+                    render_option = vis.get_render_option()
+                    render_option.point_size = 2.0
+                    render_option.background_color = np.array([1.0, 1.0, 1.0])
+
+                    title = (
+                        f"All Trajectories Aligned | t={t_cur:.3f}s "
+                        f"| step {controller.time_idx + 1}/{len(all_times)} "
+                        f"| playing={'ON' if controller.playing else 'OFF'}"
+                    )
+                    title += f" | XFilter:{'ON' if controller.enable_x_filter else 'OFF'}"
+                    title += f" | Det:{'ON' if controller.show_detection_sphere else 'OFF'}"
+                    title += f" | KF:{'ON' if controller.show_kf_sphere else 'OFF'}"
+                    title += f" | GT:{'ON' if controller.show_ground_truth_marker else 'OFF'}"
+                    print(f"\r{title}", end="", flush=True)
+
+                    controller.should_update = False
+
+                if not vis.poll_events():
+                    break
+                vis.update_renderer()
+
+            print("\n\n所有轨迹按时间戳对齐可视化完成")
+        except KeyboardInterrupt:
+            print("\n\n检测到Ctrl+C，退出可视化")
+        finally:
+            try:
+                vis.destroy_window()
+            except:
+                pass
     
     # 如果未指定文件，自动扫描目录
     if args.trajectory_file is None:
@@ -1983,8 +2358,9 @@ def main():
             print(f"错误: 目录不存在: {data_dir}")
             return
         
-        # 查找所有轨迹JSON文件
+        # 查找所有轨迹JSON文件并按轨迹时间排序
         json_files = sorted(data_dir.glob('trajectory_*.json'))
+        json_files = sort_json_files_by_time(json_files)
         if len(json_files) == 0:
             print(f"错误: 在 {data_dir} 中未找到任何轨迹文件")
             return
@@ -2015,127 +2391,8 @@ def main():
                     print(f"  [失败] {json_file.name}: {e}")
             print("[文档写回] 完成\n")
 
-        if not args.no_pre_stats:
-            # 可视化开始前，先打印所有轨迹整体的Detection-GT差值统计
-            print("\n" + "="*80)
-            print("可视化开始前统计：所有轨迹整体 [Detection-GT / KF-GT 差值统计]")
-            print("="*80)
-
-            all_det_errors = []
-            det_valid_frame_sum = 0
-            det_total_frame_sum = 0
-            det_used_trajectory_count = 0
-
-            all_kf_errors = []
-            kf_valid_frame_sum = 0
-            kf_total_frame_sum = 0
-            kf_used_trajectory_count = 0
-
-            for idx, json_file in enumerate(json_files, start=1):
-                try:
-                    stat_visualizer = TrajectoryVisualizer(json_file)
-                    configure_visualizer(stat_visualizer)
-
-                    det_stat_result = stat_visualizer.compute_detection_gt_error_statistics(
-                        start_frame=args.start,
-                        end_frame=args.end
-                    )
-
-                    kf_stat_result = stat_visualizer.compute_kf_gt_error_statistics(
-                        start_frame=args.start,
-                        end_frame=args.end
-                    )
-
-                    if det_stat_result is not None:
-                        all_det_errors.append(det_stat_result['e'])
-                        det_valid_frame_sum += det_stat_result['valid_count']
-                        det_total_frame_sum += det_stat_result['total_count']
-                        det_used_trajectory_count += 1
-                    else:
-                        det_total_frame_sum += (args.end - args.start) if args.end is not None else len(stat_visualizer.frames) - args.start
-
-                    if kf_stat_result is not None:
-                        all_kf_errors.append(kf_stat_result['e'])
-                        kf_valid_frame_sum += kf_stat_result['valid_count']
-                        kf_total_frame_sum += kf_stat_result['total_count']
-                        kf_used_trajectory_count += 1
-                    else:
-                        kf_total_frame_sum += (args.end - args.start) if args.end is not None else len(stat_visualizer.frames) - args.start
-                except Exception as e:
-                    print(f"  轨迹统计失败 [{idx}/{len(json_files)}] {json_file.name}: {e}")
-
-            if len(all_det_errors) == 0:
-                print("[Detection-GT差值统计] 所有轨迹整体: 无可用的Detection-GT配对数据")
-            else:
-                all_e = np.vstack(all_det_errors)
-                stats_x = TrajectoryVisualizer._calc_error_stats(all_e[:, 0])
-                stats_y = TrajectoryVisualizer._calc_error_stats(all_e[:, 1])
-                stats_z = TrajectoryVisualizer._calc_error_stats(all_e[:, 2])
-
-                print(f"[Detection-GT差值统计] 所有轨迹整体 (det - gt), 单位: m")
-                for axis_name, s in zip(['X', 'Y', 'Z'], [stats_x, stats_y, stats_z]):
-                    print(
-                        f"  {axis_name}: max={s['max']:.6f}, min={s['min']:.6f}, mean={s['mean']:.6f}, std={s['std']:.6f}, "
-                        f"abs_mean={s['abs_mean']:.6f}, abs_std={s['abs_std']:.6f}"
-                    )
-                print(f"  有效帧总数: {det_valid_frame_sum}/{det_total_frame_sum}")
-                print(f"  参与统计轨迹数: {det_used_trajectory_count}/{len(json_files)}")
-
-            if len(all_kf_errors) == 0:
-                print("[KF-GT差值统计] 所有轨迹整体: 无可用的KF-GT配对数据")
-            else:
-                all_e = np.vstack(all_kf_errors)
-                stats_x = TrajectoryVisualizer._calc_error_stats(all_e[:, 0])
-                stats_y = TrajectoryVisualizer._calc_error_stats(all_e[:, 1])
-                stats_z = TrajectoryVisualizer._calc_error_stats(all_e[:, 2])
-
-                print(f"[KF-GT差值统计] 所有轨迹整体 (kf - gt), 单位: m")
-                for axis_name, s in zip(['X', 'Y', 'Z'], [stats_x, stats_y, stats_z]):
-                    print(
-                        f"  {axis_name}: max={s['max']:.6f}, min={s['min']:.6f}, mean={s['mean']:.6f}, std={s['std']:.6f}, "
-                        f"abs_mean={s['abs_mean']:.6f}, abs_std={s['abs_std']:.6f}"
-                    )
-                print(f"  有效帧总数: {kf_valid_frame_sum}/{kf_total_frame_sum}")
-                print(f"  参与统计轨迹数: {kf_used_trajectory_count}/{len(json_files)}")
-            print("="*80 + "\n")
-        else:
-            print("\n已关闭可视化前预统计（--no-pre-stats）\n")
-        
-        current_trajectory = 0
-        
         try:
-            while 0 <= current_trajectory < len(json_files):
-                json_file = json_files[current_trajectory]
-                print(f"\n{'='*60}")
-                print(f"轨迹 {current_trajectory+1}/{len(json_files)}: {json_file.name}")
-                print('='*60)
-                
-                try:
-                    visualizer = TrajectoryVisualizer(json_file)
-                    configure_visualizer(visualizer)
-                    # 如果提供了命令行参数，更新相机变换
-                    if args.cam_height != 0.3 or args.cam_forward != 0.0 or args.cam_lateral != 0.0:
-                        print(f"警告: 使用自定义相机参数会覆盖实际外参")
-                    
-                    switch = visualizer.visualize_all(
-                        start_frame=args.start, 
-                        end_frame=args.end,
-                        trajectory_info=(current_trajectory+1, len(json_files))
-                    )
-                    
-                    # 根据返回值决定下一步
-                    if switch == 1:  # 下一条轨迹
-                        current_trajectory += 1
-                    elif switch == -1:  # 上一条轨迹
-                        current_trajectory -= 1
-                    else:  # 退出
-                        break
-                        
-                except KeyboardInterrupt:
-                    print("\n检测到Ctrl+C，停止可视化")
-                    break
-            
-            print(f"\n可视化完成")
+            run_multi_trajectory_single_window(json_files)
         except KeyboardInterrupt:
             print("\n\n程序已中断")
         except Exception as e:
@@ -2168,12 +2425,6 @@ def main():
             if write_result['backup_path'] is not None:
                 print(f"[文档写回] 备份文件: {write_result['backup_path']}")
 
-        # 可视化开始前先打印当前轨迹统计（可开关）
-        if not args.no_pre_stats:
-            visualizer.print_detection_gt_error_statistics(start_frame=args.start, end_frame=args.end)
-            visualizer.print_kf_gt_error_statistics(start_frame=args.start, end_frame=args.end)
-        else:
-            print("\n已关闭可视化前预统计（--no-pre-stats）\n")
         visualizer.visualize_all(start_frame=args.start, end_frame=args.end)
 
 
