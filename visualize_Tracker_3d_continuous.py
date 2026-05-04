@@ -117,6 +117,9 @@ class TrajectoryVisualizer:
         # 轨迹线显示开关（交互3D）
         self.show_detection_trajectory = True
         self.show_ground_truth_trajectory = True
+        
+        # 速度箭头显示开关
+        self.show_velocity_arrow = True
 
         # 缓存每帧的GT估计结果，避免重复计算
         self.gt_result_cache = {}
@@ -1248,6 +1251,12 @@ class TrajectoryVisualizer:
         """
         frame = self.frames[frame_idx]
         
+        # 调试：打印帧数据的键
+        print(f"\n帧 {frame_idx} 数据键: {list(frame.keys())}")
+        print(f"kf_vel 是否存在: {'kf_vel' in frame}")
+        if 'kf_vel' in frame:
+            print(f"kf_vel 值: {frame.get('kf_vel')}")
+        
         # 加载RGB和深度图像
         rgb_path = self.image_dir / frame['rgb_file']
         depth_path = self.image_dir / frame['depth_file']
@@ -1308,24 +1317,21 @@ class TrajectoryVisualizer:
             geometries.append(gt_sphere)
         
         # 添加速度向量（绿色箭头）
-        if frame['kf_vel'] is not None and frame['kf_pos'] is not None:
+        if self.show_velocity_arrow and frame.get('kf_vel') is not None and frame.get('kf_pos') is not None:
             kf_pos = np.array(frame['kf_pos'])
             kf_vel = np.array(frame['kf_vel'])
             
             # 速度向量缩放（用于可视化）
-            vel_scale = 0.1
-            vel_end = kf_pos + kf_vel * vel_scale
-            
-            # 创建箭头（使用圆柱体和圆锥）
-            arrow_length = np.linalg.norm(kf_vel * vel_scale)
-            if arrow_length > 0.001:  # 避免零长度
-                # 归一化方向
-                direction = (vel_end - kf_pos) / arrow_length
+            speed = float(np.linalg.norm(kf_vel))
+            if speed > 1e-6:
+                vel_scale = 0.35
+                arrow_length = max(speed * vel_scale, 0.05)
+                direction = kf_vel / speed
                 
                 # 创建圆柱体（箭身）
                 cylinder_height = arrow_length * 0.8
                 cylinder = o3d.geometry.TriangleMesh.create_cylinder(
-                    radius=0.005,
+                    radius=0.007,
                     height=cylinder_height
                 )
                 cylinder.paint_uniform_color([0.0, 1.0, 0.0])  # 绿色
@@ -1333,7 +1339,7 @@ class TrajectoryVisualizer:
                 # 创建圆锥（箭头）
                 cone_height = arrow_length * 0.2
                 cone = o3d.geometry.TriangleMesh.create_cone(
-                    radius=0.01,
+                    radius=0.014,
                     height=cone_height
                 )
                 cone.paint_uniform_color([0.0, 1.0, 0.0])  # 绿色
@@ -1510,6 +1516,7 @@ class TrajectoryVisualizer:
         print("  G             : 切换Ground Truth位置显示")
         print("  3             : 切换Detection轨迹线显示")
         print("  4             : 切换GT轨迹线显示")
+        print("  V             : 切换速度箭头显示")
         print("  P             : 已禁用（不保存DepthCapture/DepthCamera文件）")
         print("  Q / ESC       : 退出")
         print("  鼠标          : 旋转/缩放视角\n")
@@ -1600,6 +1607,13 @@ class TrajectoryVisualizer:
             print(f"\n[GT轨迹] 显示: {status}")
             controller.should_update = True
             return False
+
+        def key_toggle_velocity_arrow(vis):
+            self.show_velocity_arrow = not self.show_velocity_arrow
+            status = "ON" if self.show_velocity_arrow else "OFF"
+            print(f"\n[速度箭头] 显示: {status}")
+            controller.should_update = True
+            return False
         
         # 注册键盘回调
         vis.register_key_callback(262, key_next)  # 右箭头
@@ -1619,6 +1633,8 @@ class TrajectoryVisualizer:
         vis.register_key_callback(ord('g'), key_toggle_ground_truth)
         vis.register_key_callback(ord('3'), key_toggle_detection_trajectory)
         vis.register_key_callback(ord('4'), key_toggle_ground_truth_trajectory)
+        vis.register_key_callback(ord('V'), key_toggle_velocity_arrow)
+        vis.register_key_callback(ord('v'), key_toggle_velocity_arrow)
         vis.register_key_callback(ord('P'), key_disable_capture)
         vis.register_key_callback(ord('p'), key_disable_capture)
         vis.register_key_callback(ord('Q'), key_quit)
@@ -1715,25 +1731,25 @@ class TrajectoryVisualizer:
                                 geometries.append(gt_line)
                         
                         # 添加速度向量（绿色箭头）
-                        if frame['kf_vel'] is not None and frame['kf_pos'] is not None:
+                        if self.show_velocity_arrow and frame.get('kf_vel') is not None and frame.get('kf_pos') is not None:
                             kf_pos = np.array(frame['kf_pos'])
                             kf_vel = np.array(frame['kf_vel'])
-                            vel_scale = 0.1
-                            arrow_length = np.linalg.norm(kf_vel * vel_scale)
+                            speed = float(np.linalg.norm(kf_vel))
                             
-                            if arrow_length > 0.001:
-                                vel_end = kf_pos + kf_vel * vel_scale
-                                direction = (vel_end - kf_pos) / arrow_length
+                            if speed > 1e-6:
+                                vel_scale = 0.35
+                                arrow_length = max(speed * vel_scale, 0.05)
+                                direction = kf_vel / speed
                                 
                                 # 创建箭头
                                 cylinder_height = arrow_length * 0.8
                                 cylinder = o3d.geometry.TriangleMesh.create_cylinder(
-                                    radius=0.005, height=cylinder_height)
+                                    radius=0.007, height=cylinder_height)
                                 cylinder.paint_uniform_color([0.0, 1.0, 0.0])
                                 
                                 cone_height = arrow_length * 0.2
                                 cone = o3d.geometry.TriangleMesh.create_cone(
-                                    radius=0.01, height=cone_height)
+                                    radius=0.014, height=cone_height)
                                 cone.paint_uniform_color([0.0, 1.0, 0.0])
                                 
                                 # 计算旋转
@@ -1792,6 +1808,7 @@ class TrajectoryVisualizer:
                         title += f" | GT:{'ON' if self.show_ground_truth_marker else 'OFF'}"
                         title += f" | DetTraj:{'ON' if self.show_detection_trajectory else 'OFF'}"
                         title += f" | GTTraj:{'ON' if self.show_ground_truth_trajectory else 'OFF'}"
+                        title += f" | Velocity:{'ON' if self.show_velocity_arrow else 'OFF'}"
                         if frame['detection_pos'] is not None and frame['kf_pos'] is not None:
                             det_pos = np.array(frame['detection_pos'])
                             kf_pos = np.array(frame['kf_pos'])
@@ -2071,6 +2088,7 @@ def main():
         print("  G             : 切换Ground Truth位置显示")
         print("  3             : 切换Detection轨迹线显示")
         print("  4             : 切换GT轨迹线显示")
+        print("  V             : 切换速度箭头显示")
         print("  Q / ESC       : 退出\n")
 
         vis = o3d.visualization.VisualizerWithKeyCallback()
@@ -2093,6 +2111,7 @@ def main():
                 self.show_ground_truth_marker = ref_viz.show_ground_truth_marker
                 self.show_detection_trajectory = ref_viz.show_detection_trajectory
                 self.show_ground_truth_trajectory = ref_viz.show_ground_truth_trajectory
+                self.show_velocity_arrow = ref_viz.show_velocity_arrow
 
         controller = Controller()
 
@@ -2106,6 +2125,7 @@ def main():
                 vz.show_ground_truth_marker = controller.show_ground_truth_marker
                 vz.show_detection_trajectory = controller.show_detection_trajectory
                 vz.show_ground_truth_trajectory = controller.show_ground_truth_trajectory
+                vz.show_velocity_arrow = controller.show_velocity_arrow
 
         def key_toggle_play(_):
             controller.playing = not controller.playing
@@ -2166,6 +2186,12 @@ def main():
             controller.should_update = True
             return False
 
+        def key_toggle_velocity_arrow(_):
+            controller.show_velocity_arrow = not controller.show_velocity_arrow
+            print(f"\n[速度箭头] {'ON' if controller.show_velocity_arrow else 'OFF'}")
+            controller.should_update = True
+            return False
+
         vis.register_key_callback(32, key_toggle_play)      # Space
         vis.register_key_callback(262, key_next)            # Right
         vis.register_key_callback(ord('D'), key_next)
@@ -2183,6 +2209,8 @@ def main():
         vis.register_key_callback(ord('g'), key_toggle_ground_truth)
         vis.register_key_callback(ord('3'), key_toggle_detection_trajectory)
         vis.register_key_callback(ord('4'), key_toggle_ground_truth_trajectory)
+        vis.register_key_callback(ord('V'), key_toggle_velocity_arrow)
+        vis.register_key_callback(ord('v'), key_toggle_velocity_arrow)
 
         geometries = []
         step_interval = 1.0 / 30.0
@@ -2301,6 +2329,47 @@ def main():
                             if gt_line is not None:
                                 geometries.append(gt_line)
 
+                        if controller.show_velocity_arrow and frame.get('kf_vel') is not None and frame.get('kf_pos') is not None:
+                            kf_pos = np.array(frame['kf_pos'], dtype=np.float64)
+                            kf_vel = np.array(frame['kf_vel'], dtype=np.float64)
+                            speed = float(np.linalg.norm(kf_vel))
+
+                            if speed > 1e-6:
+                                vel_scale = 0.35
+                                arrow_length = max(speed * vel_scale, 0.05)
+                                direction = kf_vel / speed
+
+                                cylinder_height = arrow_length * 0.8
+                                cylinder = o3d.geometry.TriangleMesh.create_cylinder(radius=0.007, height=cylinder_height)
+                                cylinder.paint_uniform_color([0.0, 1.0, 0.0])
+
+                                cone_height = arrow_length * 0.2
+                                cone = o3d.geometry.TriangleMesh.create_cone(radius=0.014, height=cone_height)
+                                cone.paint_uniform_color([0.0, 1.0, 0.0])
+
+                                z_axis = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+                                rotation_axis = np.cross(z_axis, direction)
+                                rotation_axis_norm = np.linalg.norm(rotation_axis)
+
+                                if rotation_axis_norm > 1e-6:
+                                    rotation_axis = rotation_axis / rotation_axis_norm
+                                    rotation_angle = np.arccos(np.clip(np.dot(z_axis, direction), -1.0, 1.0))
+                                    K = np.array([
+                                        [0.0, -rotation_axis[2], rotation_axis[1]],
+                                        [rotation_axis[2], 0.0, -rotation_axis[0]],
+                                        [-rotation_axis[1], rotation_axis[0], 0.0]
+                                    ])
+                                    R = np.eye(3) + np.sin(rotation_angle) * K + (1 - np.cos(rotation_angle)) * (K @ K)
+                                else:
+                                    R = np.diag([1.0, 1.0, -1.0]) if np.dot(z_axis, direction) < 0 else np.eye(3)
+
+                                cylinder.rotate(R, center=[0, 0, 0])
+                                cylinder.translate(kf_pos + direction * cylinder_height / 2)
+                                cone.rotate(R, center=[0, 0, 0])
+                                cone.translate(kf_pos + direction * (cylinder_height + cone_height / 2))
+                                geometries.append(cylinder)
+                                geometries.append(cone)
+
                         rendered_trackers += 1
 
                     for g in geometries:
@@ -2329,6 +2398,7 @@ def main():
                     title += f" | Det:{'ON' if controller.show_detection_sphere else 'OFF'}"
                     title += f" | KF:{'ON' if controller.show_kf_sphere else 'OFF'}"
                     title += f" | GT:{'ON' if controller.show_ground_truth_marker else 'OFF'}"
+                    title += f" | Vel:{'ON' if controller.show_velocity_arrow else 'OFF'}"
                     print(f"\r{title}", end="", flush=True)
 
                     controller.should_update = False

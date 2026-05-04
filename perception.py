@@ -1722,6 +1722,7 @@ class KalmanFilter3D:
 
         # 5) 状态更新
         self.kf_x = self.kf_x + K @ y_sel
+        self.kf_x[:3] = measurement[:3]  # 保持位置不变
 
         # Joseph form 协方差更新
         I = np.eye(self.state_dim, dtype=float)

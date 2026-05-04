@@ -21,6 +21,7 @@ trajectory_data/
 trajectory_data_fit/
 trajectory_data_kf/
 trajectory_data_kf_g_state/
+SLAM_trajectory/
 
 # Optional large media/data dirs
 data/

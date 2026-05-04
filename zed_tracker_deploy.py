@@ -5,8 +5,10 @@ from sensor_msgs.msg import Image, Imu
 from geometry_msgs.msg import Vector3Stamped, PoseStamped
 from std_msgs.msg import Float32MultiArray, ColorRGBA
 from visualization_msgs.msg import Marker, MarkerArray
+from nav_msgs.msg import Odometry
 from cv_bridge import CvBridge
 from tf2_ros import TransformListener, Buffer
+from rclpy.qos import qos_profile_sensor_data
 import cv2
 import os
 from datetime import datetime
@@ -15,6 +17,7 @@ import shutil
 import time
 import yaml
 from pathlib import Path
+import matplotlib.pyplot as plt
 from perception import CameraIntrinsics, BallTracker, BallTrackingVisualizer
 import message_filters
 
@@ -105,6 +108,8 @@ class BallTrackingNode(Node):
         self.latest_cam_rot = np.eye(3)  # 相机旋转矩阵
         self.latest_base_pos = np.array([0.0, 0.0, 0.0])  # 机器人本体位置（用于坐标转换）
         self.latest_base_rot = np.eye(3)  # 机器人本体旋转矩阵（用于坐标转换）
+        self.latest_lidar_pose = None  # (pos[3], rot[3,3])
+        self.latest_body_pose = None  # (pos[3], rot[3,3])
         
         # === 图像变化检测 ===
         self.prev_rgb_id = None  # 上一帧RGB图像的id
@@ -166,6 +171,28 @@ class BallTrackingNode(Node):
         self.center_border_pixels = int(detector_cfg.get('center_border_pixels', tracker_config.get('center_border_pixels', 50)))
         self.center_method = detector_cfg.get('center_method', tracker_config.get('center_method', 'min_depth'))
         self.ball_radius = float(detector_cfg.get('ball_radius', tracker_config.get('ball_radius', 0.0375)))
+
+        # 机器人本体世界位置来源可选：
+        self.base_position_source = str(
+            runtime_cfg.get('base_position_source', 'world_model')
+        ).strip().lower()
+        self.world_model_prediction_topic = str(
+            runtime_cfg.get('world_model_prediction_topic', 'world_model_prediction')
+        )
+        self.odometry_imu_topic = str(
+            runtime_cfg.get('odometry_imu_topic', '/odometry/imu')
+        )
+
+        # /odometry/imu 到 imu_link 的固定外参
+        # 配置语义：odom 在 imu 坐标系下的位姿 T_imu_odom = [R_imu_odom, t_imu_odom]
+        odom_extr = runtime_cfg.get('odometry_to_imu_extrinsics', {})
+        self.odom_in_imu_pos = np.asarray(
+            odom_extr.get('position', [0.0, 0.0, 0.0]), dtype=np.float64
+        ).reshape(3)
+        self.odom_in_imu_rot = np.asarray(
+            odom_extr.get('rotation', np.eye(3).tolist()), dtype=np.float64
+        ).reshape(3, 3)
+
         # 轨迹保存坐标系：'body' 或 'world'
         self.trajectory_coord_frame = str(
             trajectory_cfg.get('coord_frame', tracker_config.get('trajectory_coord_frame', 'body'))
@@ -217,12 +244,21 @@ class BallTrackingNode(Node):
         self.latest_has_detection = {}  # 最新的检测状态
         self.latest_detection_results = []  # 最新的检测结果（用于marker可视化）
         
+        
+        #======SLAM============
+        # R_diff 递推均值
+        self.rdiff_count = 0
+        self.rdiff_mean = np.eye(3, dtype=np.float64)
+        
         # === 3D 可视化 ===
         if self.enable_3D_visualization:
             self.visualizer = BallTrackingVisualizer(
                 num_balls=self.num_balls
             )
-            pass
+            self.frame_fig = plt.figure(figsize=(8, 6))
+            self.frame_ax = self.frame_fig.add_subplot(111, projection='3d')
+            self.frame_fig.suptitle('Lidar/Body Frames (World)')
+            plt.ion()
         
         if self.enable_visualization:
             cv2.namedWindow('Ball Tracking - RGB', cv2.WINDOW_NORMAL)
@@ -252,13 +288,33 @@ class BallTrackingNode(Node):
         )
         self.sync.registerCallback(self.images_callback)
         
-        # 订阅 world_model_prediction
-        self.world_model_pred_sub = self.create_subscription(
-            Float32MultiArray,
-            'world_model_prediction',
-            self.world_model_pred_callback,
-            1
-        )
+        # 订阅机器人本体世界位置来源（二选一）
+        self.world_model_pred_sub = None
+        self.odometry_imu_sub = None
+        if self.base_position_source == 'slam':
+            self.odometry_imu_sub = self.create_subscription(
+                Odometry,
+                self.odometry_imu_topic,
+                self.odometry_imu_callback,
+                qos_profile_sensor_data,
+            )
+            self.get_logger().info(
+                f"Base position source: odometry (topic={self.odometry_imu_topic})"
+            )
+            self.get_logger().info(
+                f"Extrinsic (odom in imu): position={self.odom_in_imu_pos.tolist()}, "
+                f"rotation={self.odom_in_imu_rot.tolist()}"
+            )
+        else:
+            self.world_model_pred_sub = self.create_subscription(
+                Float32MultiArray,
+                self.world_model_prediction_topic,
+                self.world_model_pred_callback,
+                1
+            )
+            self.get_logger().info(
+                f"Base position source: world_model_prediction (topic={self.world_model_prediction_topic})"
+            )
 
         
         # === ROS 发布器 ===
@@ -286,7 +342,7 @@ class BallTrackingNode(Node):
                 node=self,
                 robot_type="H1",
                 num_dof=20,
-                control_frequency=50.0,
+                control_frequency=200.0,
                 interpolation_order=0.0
             )
             
@@ -360,7 +416,59 @@ class BallTrackingNode(Node):
             self.latest_base_pos = np.array([msg.data[0], msg.data[1], msg.data[2]])
         else:
             self.latest_base_pos = np.array([0.0, 0.0, 0.0])
-            
+
+    def odometry_imu_callback(self, msg: Odometry):
+        """接收/odometry/imu并提取世界位置。"""
+        p = msg.pose.pose.position
+        p_odom_world = np.array([float(p.x), float(p.y), float(p.z)], dtype=np.float64)
+
+        # 姿态优先使用 robot 的 q（RobotClient / lowstate IMU）
+        quat_robot, _ = self.get_robot_imu_data()
+        R_robot_rot = self.quat_to_rot_matrix(quat_robot)
+
+        q = msg.pose.pose.orientation  # geometry_msgs四元数顺序: x,y,z,w
+        quat_lidar = np.array([q.w, q.x, q.y, q.z], dtype=np.float64)
+        R_lidar_rot = self.quat_to_rot_matrix(quat_lidar)
+
+        # 从lidar坐标系到robot坐标系的旋转差异
+        R_diff = R_robot_rot @ R_lidar_rot.T
+        R_diff = self._update_rdiff_mean(R_diff)
+        # 将p_odom_world从lidar坐标系补偿到robot坐标系
+        p_odom_world_compensated = R_diff @ p_odom_world
+
+        # 以robot imu 为准
+        R_odom_world = R_robot_rot
+
+        # 已知 T_imu_odom，先求 T_odom_imu
+        R_imu_odom = self.odom_in_imu_rot
+        t_imu_odom = self.odom_in_imu_pos
+        R_odom_imu = R_imu_odom.T
+        t_odom_imu = -R_odom_imu @ t_imu_odom
+
+        # p_imu_world = p_odom_world + R_odom_world @ t_odom_imu
+        
+        self.latest_base_pos = p_odom_world_compensated + R_odom_world @ t_odom_imu
+
+        # 保存两套frame用于3D可视化
+        self.latest_lidar_pose = (p_odom_world_compensated, R_robot_rot)
+        self.latest_body_pose = (self.latest_base_pos, R_robot_rot)
+        
+        print(f"Using SLAM data for base position: {self.latest_base_pos}")
+
+
+    def _update_rdiff_mean(self, R_new: np.ndarray) -> np.ndarray:
+        """递推更新 R_diff 的均值，并正交化返回。"""
+        self.rdiff_count += 1
+        alpha = 1.0 / float(self.rdiff_count)
+        self.rdiff_mean = self.rdiff_mean + alpha * (R_new - self.rdiff_mean)
+        U, _, Vt = np.linalg.svd(self.rdiff_mean)
+        R_ortho = U @ Vt
+        if np.linalg.det(R_ortho) < 0:
+            U[:, -1] *= -1
+            R_ortho = U @ Vt
+        return R_ortho
+
+       
     def get_robot_imu_data(self):
         """
         从 RobotClient 获取机器人 IMU 姿态数据
@@ -376,12 +484,27 @@ class BallTrackingNode(Node):
         
         # 获取四元数 (w, x, y, z)
         quat = self.robot.quat
-        # print(f"Robot IMU Quaternion: {quat}")
+        print(f"Robot IMU Quaternion: {quat}")
         # 获取角速度
         angular_vel = self.robot.angular_velocity
         
         return quat, angular_vel
             
+    @staticmethod
+    def quat_multiply(q1, q2):
+        """
+        四元数乘法 q1 * q2
+        q: [w, x, y, z]
+        """
+        w1, x1, y1, z1 = q1
+        w2, x2, y2, z2 = q2
+        return np.array([
+            w1*w2 - x1*x2 - y1*y2 - z1*z2,
+            w1*x2 + x1*w2 + y1*z2 - z1*y2,
+            w1*y2 - x1*z2 + y1*w2 + z1*x2,
+            w1*z2 + x1*y2 - y1*x2 + z1*w2
+        ])
+
     @staticmethod
     def quat_to_rot_matrix(quat):
         """
@@ -476,8 +599,8 @@ class BallTrackingNode(Node):
         self.frame_count += 1
         
         # === 获取当前机器人本体状态 ===
-        # 从 world_model_prediction 获取位置
-        base_pos_world = self.latest_base_pos.copy()  # 机器人本体世界位置（来自 world_model_prediction）
+        # 从配置指定来源获取位置（world_model_prediction 或 /odometry/imu）
+        base_pos_world = self.latest_base_pos.copy()
         base_rot = self.get_base_rotation()            # 机器人本体世界姿态（来自 RobotClient）
         
         # 转换到相对坐标（相对于初始位置）
@@ -1350,6 +1473,29 @@ class BallTrackingNode(Node):
         # 更新matplotlib 3D可视化
         if hasattr(self, 'latest_has_detection') and self.enable_3D_visualization:
             self.visualizer.update_visualization(self.ball_tracker, self.latest_has_detection)
+
+        # 3D 画两套frame（lidar/body）
+        if self.enable_3D_visualization and hasattr(self, 'frame_ax'):
+            ax = self.frame_ax
+            ax.cla()
+            ax.set_title('World(odom) + Lidar/Body Frames')
+            ax.set_xlabel('X [m]')
+            ax.set_ylabel('Y [m]')
+            ax.set_zlabel('Z [m]')
+            ax.grid(True)
+
+            # 世界坐标系
+            self._draw_pose_frame(ax, np.zeros(3), np.eye(3), scale=0.2)
+
+            if self.latest_lidar_pose is not None:
+                lidar_pos, lidar_rot = self.latest_lidar_pose
+                self._draw_pose_frame(ax, lidar_pos, lidar_rot, scale=0.15)
+
+            if self.latest_body_pose is not None:
+                body_pos, body_rot = self.latest_body_pose
+                self._draw_pose_frame(ax, body_pos, body_rot, scale=0.15)
+
+            plt.pause(0.001)
         
         # 更新2D图像可视化
         if self.latest_rgb_vis is not None:
@@ -1366,6 +1512,16 @@ class BallTrackingNode(Node):
             cv2.destroyAllWindows()
             if rclpy.ok():
                 rclpy.shutdown()
+
+    @staticmethod
+    def _draw_pose_frame(ax, pos: np.ndarray, rot: np.ndarray, scale: float = 0.15):
+        px, py, pz = pos
+        x_axis = rot[:, 0] * scale
+        y_axis = rot[:, 1] * scale
+        z_axis = rot[:, 2] * scale
+        ax.quiver(px, py, pz, x_axis[0], x_axis[1], x_axis[2], color='r', linewidth=2)
+        ax.quiver(px, py, pz, y_axis[0], y_axis[1], y_axis[2], color='g', linewidth=2)
+        ax.quiver(px, py, pz, z_axis[0], z_axis[1], z_axis[2], color='b', linewidth=2)
 
 
 
