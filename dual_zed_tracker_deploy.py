@@ -21,7 +21,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 from perception import CameraIntrinsics, BallTracker, BallTrackingVisualizer
 import message_filters
-
+from rclpy.qos import qos_profile_sensor_data
 
 class BallTrackingNode(Node):
     """
@@ -49,9 +49,11 @@ class BallTrackingNode(Node):
         camera_profile_name = str(camera_section.get('profile', 'left_rect'))
         profile_cfg = camera_profiles.get(camera_profile_name, {})
 
-        self.camera_topic = profile_cfg.get('image_topic', '/right/zed_node/left/image_rect_color')
-        self.depth_topic = profile_cfg.get('depth_topic', '/right/zed_node/depth/depth_registered')
-
+        self.right_camera_topic = profile_cfg.get('right_image_topic', '/right/zed_node/rgb/image_rect_color')
+        self.left_camera_topic = profile_cfg.get('left_image_topic', '/left/zed_node/rgb/image_rect_color')
+        self.right_depth_topic = profile_cfg.get('right_depth_topic', '/right/zed_node/depth/depth_registered')
+        self.left_depth_topic = profile_cfg.get('left_depth_topic', '/left/zed_node/depth/depth_registered')
+        
         undistort_cfg = profile_cfg.get('undistort', {})
         self.use_raw_undistort = bool(undistort_cfg.get('enabled', False))
         self.map1 = None
@@ -95,7 +97,7 @@ class BallTrackingNode(Node):
             )
 
         self.get_logger().info(
-            f"Camera profile={camera_profile_name}, image_topic={self.camera_topic}, depth_topic={self.depth_topic}, "
+            f"Camera profile={camera_profile_name}, left_image_topic={self.left_camera_topic}, right_image_topic={self.right_camera_topic}, left_depth_topic={self.left_depth_topic}, right_depth_topic={self.right_depth_topic}"
             f"undistort={'on' if self.use_raw_undistort else 'off'}"
         )
         
@@ -103,7 +105,13 @@ class BallTrackingNode(Node):
         # === 数据存储 ===
         self.latest_rgb = None
         self.latest_depth = None
+        self.latest_right_rgb = None
+        self.latest_right_depth = None
+        self.latest_left_rgb = None
+        self.latest_left_depth = None
         self.latest_image_timestamp = None  # 保存图像时间戳（用于marker时间同步）
+        self.latest_right_image_timestamp = None
+        self.latest_left_image_timestamp = None
         self.prev_predict_time_sec = None   # 上一帧预测时刻（秒，用于动态dt）
         self.latest_cam_pos = np.array([0.0, 0.0, 0.0])  # 相机世界位置（用于marker可视化）
         self.latest_cam_rot = np.eye(3)  # 相机旋转矩阵
@@ -274,23 +282,41 @@ class BallTrackingNode(Node):
         
         # === ROS 订阅器（使用消息同步）===
         # 创建订阅器但不直接注册回调
-        rgb_sub = message_filters.Subscriber(
+        right_rgb_sub = message_filters.Subscriber(
             self,
             Image,
-            self.camera_topic
+            self.right_camera_topic,
+            qos_profile=qos_profile_sensor_data
         )
         
-        depth_sub = message_filters.Subscriber(
+        left_rgb_sub = message_filters.Subscriber(
             self,
             Image,
-            self.depth_topic
+            self.left_camera_topic,
+            qos_profile=qos_profile_sensor_data
         )
+        
+        right_depth_sub = message_filters.Subscriber(
+            self,
+            Image,
+            self.right_depth_topic,
+            qos_profile=qos_profile_sensor_data
+        )
+        
+        left_depth_sub = message_filters.Subscriber(
+            self,
+            Image,
+            self.left_depth_topic,
+            qos_profile=qos_profile_sensor_data
+        )
+        
+        
         
         # 使用近似时间同步器（允许5ms的时间差）
         self.sync = message_filters.ApproximateTimeSynchronizer(
-            [rgb_sub, depth_sub],
-            queue_size=10,
-            slop=0.001  # 1ms 时间容差
+            [right_rgb_sub, right_depth_sub, left_rgb_sub, left_depth_sub],
+            queue_size=20,# old：10
+            slop=0.02  # old：0.001  1ms 时间容差
         )
         self.sync.registerCallback(self.images_callback)
         
@@ -366,52 +392,60 @@ class BallTrackingNode(Node):
         # if self.enable_visualization:
         #     self.get_logger().info("Visualization enabled - Press 'q' to quit")
         
-    def images_callback(self, rgb_msg, depth_msg):
+    def _process_rgb_depth_pair(self, rgb_msg, depth_msg):
+        """将一组 RGB + depth 消息转换为可追踪图像。"""
+        cv_image = self.bridge.imgmsg_to_cv2(rgb_msg, desired_encoding='bgr8')
+        cv_depth = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
+
+        if self.use_raw_undistort and self.map1 is not None and self.map2 is not None:
+            cv_image = cv2.remap(
+                cv_image,
+                self.map1,
+                self.map2,
+                interpolation=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+            )
+
+        image_masked = cv_image.copy()
+        depth_mask = (cv_depth > 0) & (cv_depth < 1.0) & np.isfinite(cv_depth)
+
+        kernel = np.ones((5, 5), np.uint8)
+        depth_mask = depth_mask.astype(np.uint8) * 255
+        depth_mask = cv2.morphologyEx(depth_mask, cv2.MORPH_OPEN, kernel)
+        depth_mask = cv2.morphologyEx(depth_mask, cv2.MORPH_CLOSE, kernel)
+        depth_mask = depth_mask > 0
+        image_masked[~depth_mask] = 0
+
+        return image_masked, cv_depth
+
+    def images_callback(self, right_rgb_msg, right_depth_msg, left_rgb_msg, left_depth_msg):
         """
         同步接收 RGB 和深度图像（保证时间对齐）
         
         Args:
-            rgb_msg: RGB 图像消息
-            depth_msg: 深度图像消息
+            right_rgb_msg: 右侧 RGB 图像消息
+            right_depth_msg: 右侧深度图像消息
+            left_rgb_msg: 左侧 RGB 图像消息
+            left_depth_msg: 左侧深度图像消息
         """
-        # 处理 RGB 图像
-        cv_image = self.bridge.imgmsg_to_cv2(rgb_msg, desired_encoding='bgr8')
-        
-        # 处理深度图像
-        cv_depth = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
-        
-        if self.use_raw_undistort and self.map1 is not None and self.map2 is not None:
-            #去畸变
-            cv_image = cv2.remap(
-            cv_image,
-            self.map1,
-            self.map2,
-            interpolation=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT)
-            
-        
-        # 使用深度信息创建mask，只保留1米以内的区域
-        cv_image_masked = cv_image.copy()
-        
-        # 创建深度mask：深度在0到1.0米之间的像素
-        depth_mask = (cv_depth > 0) & (cv_depth < 1.0) & np.isfinite(cv_depth)
-        
-        # 对mask进行形态学处理以去除噪声
-        kernel = np.ones((5, 5), np.uint8)
-        # 开运算：先腐蚀后膨胀，去除小噪点
-        depth_mask = depth_mask.astype(np.uint8) * 255
-        depth_mask = cv2.morphologyEx(depth_mask, cv2.MORPH_OPEN, kernel)
-        # 闭运算：先膨胀后腐蚀，填补空洞
-        depth_mask = cv2.morphologyEx(depth_mask, cv2.MORPH_CLOSE, kernel)
-        depth_mask = depth_mask > 0
-        
-        # 将深度大于1.0米的区域设置为黑色
-        cv_image_masked[~depth_mask] = 0
-        
+        # 分别处理右/左两组图像
+        right_cv_image_masked, right_cv_depth = self._process_rgb_depth_pair(right_rgb_msg, right_depth_msg)
+        left_cv_image_masked, left_cv_depth = self._process_rgb_depth_pair(left_rgb_msg, left_depth_msg)
+
         # 保存同步后的图像和时间戳
-        self.latest_rgb = cv_image_masked
-        self.latest_depth = cv_depth
-        self.latest_image_timestamp = rgb_msg.header.stamp  # 保存时间戳用于marker同步
+        self.latest_right_rgb = right_cv_image_masked
+        self.latest_right_depth = right_cv_depth
+        self.latest_left_rgb = left_cv_image_masked
+        self.latest_left_depth = left_cv_depth
+
+        self.latest_right_image_timestamp = right_rgb_msg.header.stamp
+        self.latest_left_image_timestamp = left_rgb_msg.header.stamp
+
+        # 兼容现有追踪逻辑：默认使用左路作为主输入
+        self.latest_rgb = self.latest_left_rgb
+        self.latest_depth = self.latest_left_depth
+        self.latest_image_timestamp = left_rgb_msg.header.stamp  # 保存时间戳用于marker同步
+
         # 直接在图像回调中处理追踪（确保处理与图像同步）
         self.process_tracking()
         
@@ -541,8 +575,8 @@ class BallTrackingNode(Node):
                 config_path = Path(__file__).parent / 'Tracker_config.yaml'
                 with open(config_path, 'r') as f:
                     camera_config = yaml.safe_load(f)
-                self.set_mode = camera_config['extrinsics']["single camera"]["set mode"]
-                extr = camera_config['extrinsics']['single camera']
+                self.set_mode = camera_config['extrinsics']["dual cameras"]["set mode"]
+                extr = camera_config['extrinsics']["dual cameras"]["left"]
                 cam_pos = np.array(extr['position'])
                 cam_rot = np.array(extr['rotation'])
                 return cam_pos, cam_rot
@@ -615,7 +649,7 @@ class BallTrackingNode(Node):
         # 转换到相对坐标（相对于初始位置）
         base_pos = base_pos_world 
         
-        # === 获取相机外参（初始化时已缓存，避免每帧重复调用） ===
+        # === 获取左相机外参（初始化时已缓存，避免每帧重复调用） ===
         cam_pos_rel, cam_rot_rel = self.cam_pos_rel_cached, self.cam_rot_rel_cached
         
         # === 计算相机在世界坐标系中的位置和姿态 ===
@@ -662,8 +696,8 @@ class BallTrackingNode(Node):
         image_changed = (current_rgb_id != self.prev_rgb_id or current_depth_id != self.prev_depth_id)
         
         # 转换 RGB 为 BGR（OpenCV 格式）
-        rgb_bgr = self.latest_rgb.copy()
-        depth_array = self.latest_depth.copy()
+        rgb_bgr = [self.latest_left_rgb.copy(), self.latest_right_rgb.copy()]
+        depth_array = [self.latest_left_depth.copy(), self.latest_right_depth.copy()]
         
         # === 检测和更新追踪 ===
         detection_results = []
@@ -724,8 +758,8 @@ class BallTrackingNode(Node):
                 detection_assignments,
                 base_rot,
                 base_pos,
-                rgb_bgr,
-                depth_array,
+                self.latest_left_rgb.copy(),
+                self.latest_left_depth.copy(),
                 current_time
             )
             
@@ -734,7 +768,12 @@ class BallTrackingNode(Node):
         
         # === 生成可视化图像 ===
         if self.enable_visualization:
-            self.generate_visualization_images(rgb_bgr, depth_array, detection_results)
+            # self.generate_visualization_images(rgb_bgr, depth_array, detection_results)
+            self.generate_visualization_images(
+                self.latest_left_rgb.copy(),
+                self.latest_left_depth.copy(),
+                detection_results
+            )
         
         # === 发布球位置markers（包括catch_info） ===
         self.publish_ball_markers(catch_info)
@@ -796,7 +835,8 @@ class BallTrackingNode(Node):
             depth_image: 深度图像
             current_time: 当前时间
         """
-        
+
+            
         # 为每个tracker记录数据
         for tracker_id in range(self.num_balls):
             if self.ball_tracker.is_validated(tracker_id):
@@ -1145,7 +1185,7 @@ class BallTrackingNode(Node):
         if self.set_mode == "vertical":
             # 旋转图像（顺时针90度）
             rgb_vis = cv2.rotate(rgb_vis, cv2.ROTATE_90_CLOCKWISE)
-        
+            
         self.latest_rgb_vis = rgb_vis
         
         # === 深度可视化 ===
@@ -1184,7 +1224,7 @@ class BallTrackingNode(Node):
                             cv2.putText(depth_vis, f"{depth_val:.2f}m", 
                                       (cx + 10, cy - 10),
                                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-                
+        
         if self.set_mode == "vertical":
             # 旋转图像（顺时针90度）
             depth_vis = cv2.rotate(depth_vis, cv2.ROTATE_90_CLOCKWISE)

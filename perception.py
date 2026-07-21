@@ -2881,20 +2881,19 @@ class BallTracker:
         # 深度值太少，直接取均值
         return np.mean(valid_depths)
     
-    def detect_and_localize_balls(self, rgb_image, depth_image, 
-                                camera_intrinsics, camera_pos, camera_rot,
-                                center_method="min_depth", ball_radius=0.0375):
-        """检测并重建所有球的3D位置
+    def localize_ball_in_camera_frame(self, rgb_image, depth_image, camera_intrinsics, center_method="min_depth", ball_radius=0.0375):
+        """
+        在相机坐标系中定位球体
 
         Args:
             rgb_image: RGB图像（BGR格式）
             depth_image: 深度图
             camera_intrinsics: CameraIntrinsics对象
-            camera_pos: 相机位置（世界坐标系）
-            camera_rot: 相机旋转矩阵
+            center_method: 中心点检测方法
+            ball_radius: 球体半径
 
         Returns:
-            list of (ball_position_world, detection_info, ray_info)
+            list of (ball_position_camera, detection_info, ray_info)
         """
         # 检测所有球
         detections = self.detector.detect_all(
@@ -2932,10 +2931,7 @@ class BallTracker:
                 point_cam = depth_surface * camera_intrinsics.pixel_to_camera_ray(x, y)
                 ray_direction = point_cam / np.linalg.norm(point_cam)
                 actual_ray_length = np.linalg.norm(point_cam)
-         
-            # 转换到世界坐标系
-            point_world = camera_pos + camera_rot @ point_cam
-            
+                   
             # 射线信息
             ray_info = {
                 'center': center,
@@ -2943,10 +2939,119 @@ class BallTracker:
                 'depth': depth_surface,
                 'point_cam': point_cam.copy(),
                 'actual_ray_length': actual_ray_length
-            }
-            
-            results.append((point_world, det, ray_info))
-            print(f"[检测] 球位置（世界坐标系）: {point_world}, 深度: {depth_surface:.3f}m, 2D中心: {center}, 相机位置: {camera_pos}, 相机旋转矩阵: {camera_rot}") 
+                }
+            results.append([det, ray_info])
+        return results
+    
+    def detect_and_localize_balls(self, rgb_image, depth_image, 
+                                camera_intrinsics, camera_pos, camera_rot,
+                                center_method="min_depth", ball_radius=0.0375):
+        """检测并重建所有球的3D位置
+
+        Args:
+            rgb_image: RGB图像（BGR格式）
+            depth_image: 深度图
+            camera_intrinsics: CameraIntrinsics对象
+            camera_pos: 相机位置（世界坐标系）
+            camera_rot: 相机旋转矩阵
+
+        Returns:
+            list of (ball_position_world, detection_info, ray_info)
+        """
+        
+        is_single_rgb = isinstance(rgb_image, np.ndarray) and rgb_image.ndim == 3
+        is_single_depth = (
+            isinstance(depth_image, np.ndarray)
+            and (depth_image.ndim == 2 or (depth_image.ndim == 3 and depth_image.shape[2] == 1))
+        )
+        
+        if is_single_rgb and is_single_depth:
+            # 检测single圖片的所有球
+            results = self.localize_ball_in_camera_frame(
+                rgb_image, depth_image, camera_intrinsics, center_method=center_method, ball_radius=ball_radius
+            )
+        else:
+            # 检测多张图片的所有球
+            for_comparing_results = []
+            for rgb, depth in zip(rgb_image, depth_image):
+                single_results = self.localize_ball_in_camera_frame(
+                    rgb, depth, camera_intrinsics, center_method=center_method, ball_radius=ball_radius
+                )
+                for_comparing_results.append(single_results)
+            # 双相机竖直平行放置，相机坐标系y方向相距15cm,将右侧相机的点云向左平移15cm，统一以左侧相机坐标系为基准
+            for det, ray_info in for_comparing_results[1]:
+                ray_info['point_cam'][1] -= 0.15
+
+                point_cam = ray_info['point_cam']
+                ray_info['ray_direction'] = point_cam / np.linalg.norm(point_cam)
+                ray_info['actual_ray_length'] = np.linalg.norm(point_cam)
+
+            # 左右结果融合
+            left_results = for_comparing_results[0]
+            right_results = for_comparing_results[1]
+
+            merged_results = []
+            used_right_indices = set()
+            merge_threshold = 0.05
+
+            for left_det, left_ray_info in left_results:
+                left_point = left_ray_info['point_cam']
+
+                best_right_idx = None
+                best_dist = float('inf')
+
+                for right_idx, (right_det, right_ray_info) in enumerate(right_results):
+                    if right_idx in used_right_indices:
+                        continue
+
+                    right_point = right_ray_info['point_cam']
+                    dist = np.linalg.norm(left_point - right_point)
+
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_right_idx = right_idx
+
+                if best_right_idx is not None and best_dist < merge_threshold:
+                    right_det, right_ray_info = right_results[best_right_idx]
+                    right_point = right_ray_info['point_cam']
+                   
+                    eps = 1e-6
+
+                    left_length = max(left_ray_info['actual_ray_length'], eps)
+                    right_length = max(right_ray_info['actual_ray_length'], eps)
+
+                    left_weight = 1.0 / left_length
+                    right_weight = 1.0 / right_length
+
+                    averaged_point = (
+                        left_point * left_weight + right_point * right_weight
+                    ) / (left_weight + right_weight)
+
+                    merged_ray_info = left_ray_info.copy()
+                    merged_ray_info['point_cam'] = averaged_point.copy()
+                    merged_ray_info['ray_direction'] = averaged_point / np.linalg.norm(averaged_point)
+                    merged_ray_info['actual_ray_length'] = np.linalg.norm(averaged_point)
+
+                    merged_results.append([left_det, merged_ray_info])
+                    used_right_indices.add(best_right_idx)
+                else:
+                    merged_results.append([left_det, left_ray_info])
+
+            for right_idx, (right_det, right_ray_info) in enumerate(right_results):
+                if right_idx not in used_right_indices:
+                    merged_results.append([right_det, right_ray_info])
+
+            results = merged_results
+                    
+             
+
+        for i, [det, ray_info] in enumerate(results):
+            point_cam = ray_info['point_cam']
+            # 转换到世界坐标系
+            point_world = camera_pos + camera_rot @ point_cam
+            results[i]= [point_world, det, ray_info]
+            print(f"[检测] 球位置（世界坐标系）: {point_world}, 深度: {ray_info['depth']:.3f}m, 2D中心: {ray_info['center']}, 相机位置: {camera_pos}, 相机旋转矩阵: {camera_rot}") 
+        
         return results
     
     def process_detection_and_update(

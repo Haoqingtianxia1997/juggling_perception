@@ -8,8 +8,8 @@ camera:
 
   profiles:
     left_raw:
-      image_topic: /zed/zed_node/left_raw/image_raw_color
-      depth_topic: /zed/zed_node/depth/depth_registered
+      image_topic: /right/zed_node/left_raw/image_raw_color
+      depth_topic: /right/zed_node/depth/depth_registered
 
       # raw 图像先做 fisheye 去畸变，再用于追踪
       undistort:
@@ -26,8 +26,8 @@ camera:
         balance: 0.0
 
     left_rect:
-      image_topic: /zed/zed_node/left/image_rect_color
-      depth_topic: /zed/zed_node/depth/depth_registered
+      image_topic: /right/zed_node/left/image_rect_color
+      depth_topic: /right/zed_node/depth/depth_registered
       undistort:
         enabled: false
       intrinsics:
@@ -58,49 +58,99 @@ intrinsics:
 
 # 相机外参（相机left_camera_optical_frame在body坐标系imu_link中的位姿）
 extrinsics:
-  # ================================竖直版相机下15度放置================================
-  # # 相机位置 [x, y, z] 米
-  # position: [0.11110453, 0.01891, 0.31793305]
-  
-  # # 相机旋转矩阵（3x3）
-  # # 从相机坐标系到body坐标系的旋转
-  # rotation:
-  #   - [-0.258819636, -1.43413153e-12, 0.965925668]
-  #   - [-6.16380883e-12, 1.0, -1.66869187e-13]
-  #   - [-0.965925668, -5.99697018e-12, -0.258819636]
-  
-  # # ================================水平版相机水平放置================================
-  # # 相机位置 [x, y, z] 米
-  # position: [0.004, 0.019, 0.365]
-  
-  # # 相机旋转矩阵（3x3）
-  # # 从相机坐标系到body坐标系的旋转
-  # rotation:
-  #   - [0.0, 0.0, 1.0]
-  #   - [-1.0, 0.0, 0.0]
-  #   - [0.0, -1.0, 0.0]
+  mode: "dual"  #"dual" or "single"
+  single camera:
+    set mode: "horizontal" #"vertical" or "horizontal"
+    # ================================竖直版相机下15度放置================================
+    # # 相机位置 [x, y, z] 米
+    # position: [0.11110453, 0.01891, 0.31793305]
+    
+    # # 相机旋转矩阵（3x3）
+    # # 从相机坐标系到body坐标系的旋转
+    # rotation:
+    #   - [-0.258819636, -1.43413153e-12, 0.965925668]
+    #   - [-6.16380883e-12, 1.0, -1.66869187e-13]
+    #   - [-0.965925668, -5.99697018e-12, -0.258819636]
+    
+    # # ================================水平版相机水平放置================================
+    # # 相机位置 [x, y, z] 米
+    # position: [0.004, 0.019, 0.365]
+    
+    # # 相机旋转矩阵（3x3）
+    # # 从相机坐标系到body坐标系的旋转
+    # rotation:
+    #   - [0.0, 0.0, 1.0]
+    #   - [-1.0, 0.0, 0.0]
+    #   - [0.0, -1.0, 0.0]
 
-  #================================水平版相机上15度放置================================
-  # 相机位置 [x, y, z] 米
-  position: [-0.016, 0.019, 0.352]
-  
-  #rotation matrix
-  rotation:
-    - [0.000, 0.259, 0.966]
-    - [-1.000, 0.000, -0.000]
-    - [-0.000, -0.966, 0.259]
+    #================================水平版相机上15度放置================================
+    # 相机位置 [x, y, z] 米
+    position: [-0.016, 0.019, 0.352]
+    
+    #rotation matrix
+    rotation:
+      - [0.000, 0.259, 0.966]
+      - [-1.000, 0.000, -0.000]
+      - [-0.000, -0.966, 0.259]
 
-  # # # ================================测试版相机水平放置================================
-  # # 相机位置 [x, y, z] 米
-  # position: [0.00, 0.00, 0.00]
+    # # # ================================测试版相机水平放置================================
+    # # 相机位置 [x, y, z] 米
+    # position: [0.00, 0.00, 0.00]
+    
+    # # 相机旋转矩阵（3x3）
+    # # 从相机坐标系到body坐标系的旋转
+    # rotation:
+    #   - [0.0, 0.0, 1.0]
+    #   - [-1.0, 0.0, 0.0]
+    #   - [0.0, -1.0, 0.0]
   
-  # # 相机旋转矩阵（3x3）
-  # # 从相机坐标系到body坐标系的旋转
-  # rotation:
-  #   - [0.0, 0.0, 1.0]
-  #   - [-1.0, 0.0, 0.0]
-  #   - [0.0, -1.0, 0.0]
+  dual cameras:
+    set mode: "vertical" #"vertical" or "horizontal"
+    #================================雙相機豎直版上15度放置================================
+    right:
+      # 相机位置 [x, y, z] 米
+      position: [0.075, -0.056, 0.344]
 
+      # 相机旋转矩阵（3x3）
+      # 从相机坐标系到body坐标系的旋转
+      rotation:
+       - [0.259,  0.000,  0.966]  
+       - [-0.000, 1.000, -0.000] 
+       - [-0.966, -0.000,  0.259]  
+
+    left:
+      # 相机位置 [x, y, z] 米
+      position: [0.075, 0.094, 0.344]
+
+      # 相机旋转矩阵（3x3）
+      # 从相机坐标系到body坐标系的旋转
+      rotation:
+       - [0.259,  0.000,  0.966]  
+       - [-0.000, 1.000, -0.000] 
+       - [-0.966, -0.000,  0.259]  
+    
+    # # ================================雙相機版水平放置================================
+    # right:
+    #   # 相机位置 [x, y, z] 米
+    #   position: [0.091, -0.056, 0.334]
+
+    #   # 相机旋转矩阵（3x3）
+    #   # 从相机坐标系到body坐标系的旋转
+    #   rotation:
+    #    - [0.000,  0.000,  1.000]  
+    #    - [-0.000, 1.000, -0.000] 
+    #    - [-1.000, -0.000,  0.000]  
+
+    # left:
+    #   # 相机位置 [x, y, z] 米
+    #   position: [0.091, 0.094, 0.334]
+
+    #   # 相机旋转矩阵（3x3）
+    #   # 从相机坐标系到body坐标系的旋转
+    #   rotation:
+    #    - [0.000,  0.000,  1.000]  
+    #    - [-0.000, 1.000, -0.000] 
+    #    - [-1.000, -0.000,  0.000]  
 
 # 球追踪器参数
 tracker:
@@ -111,7 +161,7 @@ tracker:
     # 机器人本体世界位置来源：
     # - "world_model"  : 订阅 Float32MultiArray（topic: world_model_prediction，数据前3维是[x,y,z]）
     # - "slam" : 订阅 nav_msgs/Odometry（topic: /odometry/imu，使用 pose.pose.position）
-    base_position_source: "slam"
+    base_position_source: "world_model"
     # 当 base_position_source=world_model 时使用
     world_model_prediction_topic: "world_model_prediction"
     # 当 base_position_source=odometry_imu 时使用 #"/odometry/imu" "/lio_sam/mapping/odometry"
@@ -155,7 +205,7 @@ tracker:
     # 中心点计算方法
     center_method: "nearest" # "min_depth"
     # RGB图像四周center无效边框像素宽度（仅用于center校验）
-    center_border_pixels: 30
+    center_border_pixels: 40
     # 轮廓检测形状约束（MultiRedBallDetector）
     min_area: 500
     max_area: 9000

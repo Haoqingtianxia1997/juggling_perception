@@ -85,7 +85,14 @@ class TrajectoryVisualizer:
         )
         
         # 相机外参
-        extr = camera_config['extrinsics']
+        mode = camera_config['extrinsics']['mode']
+        if mode == "single":
+            extr = camera_config['extrinsics']['single camera']
+        elif mode == "dual":
+            extr = camera_config['extrinsics']['dual cameras']["left"]
+        else:
+            raise ValueError(f"Unsupported extrinsics mode: {mode}")
+
         camera_position_in_body = np.array(extr['position'])
         camera_rotation_in_body = np.array(extr['rotation'])
         
