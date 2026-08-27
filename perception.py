@@ -3313,16 +3313,16 @@ class BallTracker:
             return None
 
         # 优先选速度向下(vz<0)的球，若无则用全部
-        # falling = [b for b in valid_balls if b['velocity'][2] < 0]
-        # pool = falling if len(falling) > 0 else valid_balls
-        # # 在 pool 中选 z 位置最低的球
-        # best_ball = min(pool, key=lambda b: b['position'][2])
+        falling = [b for b in valid_balls if b['velocity'][2] < 0]
+        pool = falling if len(falling) > 0 else valid_balls
+        # 在 pool 中选 z 位置最低的球
+        best_ball = min(pool, key=lambda b: b['position'][2])
         #  =================================================================
         # 只允许下降球进入接球策略观测。
-        falling = [b for b in valid_balls if b['velocity'][2] < 0]
-        if len(falling) == 0:
-            return None
-        best_ball = min(falling, key=lambda b: b['position'][2])
+        # falling = [b for b in valid_balls if b['velocity'][2] < 0]
+        # if len(falling) == 0:
+        #     return None
+        # best_ball = min(falling, key=lambda b: b['position'][2])
 
         return {
             'position': best_ball['position'].copy(),

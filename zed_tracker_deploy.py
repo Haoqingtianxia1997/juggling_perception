@@ -768,14 +768,14 @@ class BallTrackingNode(Node):
                     f"Vel: [{catch_info['velocity'][0]:.3f}, "
                     f"{catch_info['velocity'][1]:.3f}, {catch_info['velocity'][2]:.3f}]"
                 )
-        else:
-            # 发布零值
-            msg = Float32MultiArray()
-            msg.data = [0.0] * 6
-            self.catch_ball_info_pub.publish(msg)
+        # else:
+        #     # 发布零值
+        #     msg = Float32MultiArray()
+        #     msg.data = [0.0] * 6
+        #     self.catch_ball_info_pub.publish(msg)
             
-            if self.frame_count % 25 == 0:
-                self.get_logger().warn("No valid catch ball info available")
+        #     if self.frame_count % 25 == 0:
+        #         self.get_logger().warn("No valid catch ball info available")
         
         end_time = time.perf_counter()
         # print(f"Frame {self.frame_count} processed in {(end_time - start_time)*1000:.1f} ms")
