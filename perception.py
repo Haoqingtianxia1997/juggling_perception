@@ -117,6 +117,38 @@ class CameraIntrinsics:
         
         return np.array([x, y, z])
 
+
+def normalize_center_border_pixels(value, default=0):
+    """Return per-edge center rejection borders, accepting the legacy scalar form."""
+    if value is None:
+        value = default
+
+    if isinstance(value, dict):
+        fallback = value.get('all', default)
+        borders = {
+            side: int(value.get(side, fallback))
+            for side in ('left', 'right', 'top', 'bottom')
+        }
+    else:
+        border = int(value)
+        borders = {side: border for side in ('left', 'right', 'top', 'bottom')}
+
+    if any(border < 0 for border in borders.values()):
+        raise ValueError(f"center_border_pixels 不能为负数: {borders}")
+    return borders
+
+
+def center_valid_bounds(image_shape, borders):
+    """Return the valid center bounds as (x_min, y_min, x_max, y_max), max exclusive."""
+    height, width = image_shape[:2]
+    borders = normalize_center_border_pixels(borders)
+    return (
+        min(borders['left'], width),
+        min(borders['top'], height),
+        max(0, width - borders['right']),
+        max(0, height - borders['bottom']),
+    )
+
 # #原始版本
 # class KalmanFilter3D:
 #     """
@@ -1975,7 +2007,7 @@ class MultiRedBallDetector:
         self.min_circularity = float(min_circularity) # 最小圆形度（与zed_image_saver.py保持一致）
 
         # center有效区域边框（四周边框内的center判为无效）
-        self.center_border_pixels = int(center_border_pixels)
+        self.center_border_pixels = normalize_center_border_pixels(center_border_pixels)
     
     def detect_all(self, image, camera_intrinsics=None, depth_image=None, center_method="min_depth"):
         """
@@ -2216,10 +2248,13 @@ class MultiRedBallDetector:
                     continue
 
                 # center边框校验：center落在图像四周边框圈内，视为无效检测
-                h, w = binary.shape[:2]
-                b = int(self.center_border_pixels)
-                b = max(0, min(b, h // 2, w // 2))
-                if b > 0 and (cx < b or cx >= (w - b) or cy < b or cy >= (h - b)):
+                x_valid_min, y_valid_min, x_valid_max, y_valid_max = center_valid_bounds(
+                    binary.shape, self.center_border_pixels
+                )
+                if not (
+                    x_valid_min <= cx < x_valid_max
+                    and y_valid_min <= cy < y_valid_max
+                ):
                     continue
 
                 # center必须在轮廓内（或边界上）
@@ -3278,10 +3313,16 @@ class BallTracker:
             return None
 
         # 优先选速度向下(vz<0)的球，若无则用全部
+        # falling = [b for b in valid_balls if b['velocity'][2] < 0]
+        # pool = falling if len(falling) > 0 else valid_balls
+        # # 在 pool 中选 z 位置最低的球
+        # best_ball = min(pool, key=lambda b: b['position'][2])
+        #  =================================================================
+        # 只允许下降球进入接球策略观测。
         falling = [b for b in valid_balls if b['velocity'][2] < 0]
-        pool = falling if len(falling) > 0 else valid_balls
-        # 在 pool 中选 z 位置最低的球
-        best_ball = min(pool, key=lambda b: b['position'][2])
+        if len(falling) == 0:
+            return None
+        best_ball = min(falling, key=lambda b: b['position'][2])
 
         return {
             'position': best_ball['position'].copy(),

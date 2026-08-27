@@ -19,7 +19,13 @@ import time
 import yaml
 from pathlib import Path
 import matplotlib.pyplot as plt
-from perception import CameraIntrinsics, BallTracker, BallTrackingVisualizer
+from perception import (
+    CameraIntrinsics,
+    BallTracker,
+    BallTrackingVisualizer,
+    center_valid_bounds,
+    normalize_center_border_pixels,
+)
 import message_filters
 from rclpy.qos import qos_profile_sensor_data
 
@@ -179,7 +185,9 @@ class BallTrackingNode(Node):
         self.use_robot_data = bool(runtime_cfg.get('use_robot_data', tracker_config.get('use_robot_data', True)))
         self.dt_dynamic = None
         self.ball_tracker = BallTracker(tracker_config=tracker_config)
-        self.center_border_pixels = int(detector_cfg.get('center_border_pixels', tracker_config.get('center_border_pixels', 50)))
+        self.center_border_pixels = normalize_center_border_pixels(
+            detector_cfg.get('center_border_pixels', tracker_config.get('center_border_pixels', 50))
+        )
         self.center_method = detector_cfg.get('center_method', tracker_config.get('center_method', 'min_depth'))
         self.ball_radius = float(detector_cfg.get('ball_radius', tracker_config.get('ball_radius', 0.0375)))
 
@@ -805,8 +813,8 @@ class BallTrackingNode(Node):
             msg.data = [0.0] * 6
             self.catch_ball_info_pub.publish(msg)
             
-            if self.frame_count % 25 == 0:
-                self.get_logger().warn("No valid catch ball info available")
+            # if self.frame_count % 25 == 0:
+            #     self.get_logger().warn("No valid catch ball info available")
         
         end_time = time.perf_counter()
         # print(f"Frame {self.frame_count} processed in {(end_time - start_time)*1000:.1f} ms")
@@ -892,18 +900,26 @@ class BallTrackingNode(Node):
 
                     # 在带标注图上也绘制 center 有效边框（仅用于center合法性判断）
                     h_ov, w_ov = rgb_to_save.shape[:2]
-                    border_ov = int(max(0, min(self.center_border_pixels, h_ov // 2, w_ov // 2)))
-                    if border_ov > 0:
+                    x_min, y_min, x_max, y_max = center_valid_bounds(
+                        rgb_to_save.shape, self.center_border_pixels
+                    )
+                    if x_min < x_max and y_min < y_max:
                         cv2.rectangle(
                             rgb_to_save,
-                            (border_ov, border_ov),
-                            (w_ov - border_ov - 1, h_ov - border_ov - 1),
+                            (x_min, y_min),
+                            (x_max - 1, y_max - 1),
                             (0, 255, 255),
                             2,
                         )
                         cv2.putText(
                             rgb_to_save,
-                            f"center valid region (border={border_ov}px)",
+                            (
+                                "center valid region "
+                                f"L{self.center_border_pixels['left']} "
+                                f"R{self.center_border_pixels['right']} "
+                                f"T{self.center_border_pixels['top']} "
+                                f"B{self.center_border_pixels['bottom']}"
+                            ),
                             (10, 22),
                             cv2.FONT_HERSHEY_SIMPLEX,
                             0.5,
@@ -912,27 +928,29 @@ class BallTrackingNode(Node):
                         )
 
                     if detection_results:
-                        for det_idx, (_, det_info, _) in enumerate(detection_results):
+                        for det_idx, detection_result in enumerate(detection_results):
+                            _, det_info, _ = detection_result
                             if det_info is None:
                                 continue
 
-                            # 轮廓（绿色）
-                            if 'contour' in det_info and det_info['contour'] is not None:
-                                cv2.drawContours(rgb_to_save, [det_info['contour']], -1, (0, 255, 0), 2)
+                            projection = self._project_detection_to_left_image(
+                                detection_result, rgb_to_save.shape
+                            )
+                            if projection is None:
+                                continue
 
-                            # 中心点（红色）和索引
-                            if 'center' in det_info and det_info['center'] is not None:
-                                center = det_info['center']
-                                cv2.circle(rgb_to_save, center, 5, (0, 0, 255), -1)
-                                cv2.putText(
-                                    rgb_to_save,
-                                    f"Det: {det_idx}",
-                                    (center[0] + 8, center[1] - 8),
-                                    cv2.FONT_HERSHEY_SIMPLEX,
-                                    0.5,
-                                    (0, 255, 255),
-                                    1,
-                                )
+                            center, radius_px, _ = projection
+                            cv2.circle(rgb_to_save, center, radius_px, (0, 255, 0), 2)
+                            cv2.circle(rgb_to_save, center, 5, (0, 0, 255), -1)
+                            cv2.putText(
+                                rgb_to_save,
+                                f"Det: {det_idx}",
+                                (center[0] + 8, center[1] - 8),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.5,
+                                (0, 255, 255),
+                                1,
+                            )
 
                     # 叠加对应tracker的KF速度信息
                     # 1) 若当前tracker有匹配检测，则在该检测center附近显示速度
@@ -958,20 +976,21 @@ class BallTrackingNode(Node):
                         if (
                             matched_det_idx is not None
                             and 0 <= matched_det_idx < len(detection_results)
-                            and detection_results[matched_det_idx][1] is not None
-                            and 'center' in detection_results[matched_det_idx][1]
-                            and detection_results[matched_det_idx][1]['center'] is not None
                         ):
-                            center = detection_results[matched_det_idx][1]['center']
-                            cv2.putText(
-                                rgb_to_save,
-                                f"KF{tracker_id} |v|={kf_speed:.2f}m/s",
-                                (center[0] + 8, center[1] + 16),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                0.5,
-                                (255, 255, 0),
-                                1,
+                            projection = self._project_detection_to_left_image(
+                                detection_results[matched_det_idx], rgb_to_save.shape
                             )
+                            if projection is not None:
+                                center, _, _ = projection
+                                cv2.putText(
+                                    rgb_to_save,
+                                    f"KF{tracker_id} |v|={kf_speed:.2f}m/s",
+                                    (center[0] + 8, center[1] + 16),
+                                    cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.5,
+                                    (255, 255, 0),
+                                    1,
+                                )
 
                     # 叠加不确定性归一化创新（vx, vy, vz）
                     nu_xyz = kf_data.get('normalized_innovation', None)
@@ -1103,6 +1122,37 @@ class BallTrackingNode(Node):
         for tid in active_ids:
             self.save_trajectory(tid)
     
+    def _project_detection_to_left_image(self, detection_result, image_shape):
+        """Project a fused detection in the left camera frame onto the left image."""
+        if detection_result is None or len(detection_result) < 3:
+            return None
+
+        ray_info = detection_result[2]
+        if ray_info is None or ray_info.get('point_cam') is None:
+            return None
+
+        point_cam = np.asarray(ray_info['point_cam'], dtype=np.float64).reshape(3)
+        if not np.all(np.isfinite(point_cam)):
+            return None
+
+        x_cam, y_cam, z_cam = point_cam
+        if z_cam <= 0.0:
+            return None
+
+        u = self.camera_intrinsics.fx * x_cam / z_cam + self.camera_intrinsics.cx
+        v = self.camera_intrinsics.fy * y_cam / z_cam + self.camera_intrinsics.cy
+        if not np.isfinite(u) or not np.isfinite(v):
+            return None
+
+        height, width = image_shape[:2]
+        center = (int(round(u)), int(round(v)))
+        if not (0 <= center[0] < width and 0 <= center[1] < height):
+            return None
+
+        radius_px = int(round(self.camera_intrinsics.fx * self.ball_radius / z_cam))
+        radius_px = max(2, radius_px)
+        return center, radius_px, float(z_cam)
+
     def generate_visualization_images(self, rgb_bgr, depth_array, detection_results):
         """
         生成带标注的可视化图像
@@ -1116,40 +1166,36 @@ class BallTrackingNode(Node):
         rgb_vis = rgb_bgr.copy()
 
         # 绘制 center 无效边框（仅用于center合法性判断，不屏蔽检测）
-        h_rgb, w_rgb = rgb_vis.shape[:2]
-        border = int(max(0, min(self.center_border_pixels, h_rgb // 2, w_rgb // 2)))
-        if border > 0:
-            cv2.rectangle(rgb_vis, (border, border), (w_rgb - border - 1, h_rgb - border - 1), (0, 255, 255), 2)
-            cv2.putText(rgb_vis, f"center valid region (border={border}px)",
+        x_min, y_min, x_max, y_max = center_valid_bounds(
+            rgb_vis.shape, self.center_border_pixels
+        )
+        if x_min < x_max and y_min < y_max:
+            cv2.rectangle(rgb_vis, (x_min, y_min), (x_max - 1, y_max - 1), (0, 255, 255), 2)
+            cv2.putText(rgb_vis,
+                        "center valid region "
+                        f"L{self.center_border_pixels['left']} "
+                        f"R{self.center_border_pixels['right']} "
+                        f"T{self.center_border_pixels['top']} "
+                        f"B{self.center_border_pixels['bottom']}",
                         (10, 22),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
         
         # 绘制检测结果
         # detection_results 是 [(pos_body, det_info, ray_info), ...] 格式（body坐标系）
         if detection_results:
-            for idx, (pos_world, det_info, ray_info) in enumerate(detection_results):
-                if det_info is not None:
-                    # 绘制轮廓（绿色）
-                    if 'contour' in det_info:
-                        cv2.drawContours(rgb_vis, [det_info['contour']], -1, (0, 255, 0), 2)
-                    
-                    # 绘制中心点（红色）
-                    if 'center' in det_info:
-                        center = det_info['center']
-                        cv2.circle(rgb_vis, center, 5, (0, 0, 255), -1)
-                        
-                        # 显示索引
-                        cv2.putText(rgb_vis, f"Det: {idx}", 
-                                  (center[0] + 10, center[1] - 10),
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
-                    
-                    # 绘制十字线
-                    if 'vert_line' in det_info and det_info['vert_line']:
-                        cv2.line(rgb_vis, det_info['vert_line'][0], det_info['vert_line'][1], 
-                               (255, 255, 0), 1)
-                    if 'hori_line' in det_info and det_info['hori_line']:
-                        cv2.line(rgb_vis, det_info['hori_line'][0], det_info['hori_line'][1], 
-                               (255, 0, 255), 1)
+            for idx, detection_result in enumerate(detection_results):
+                projection = self._project_detection_to_left_image(
+                    detection_result, rgb_vis.shape
+                )
+                if projection is None:
+                    continue
+
+                center, radius_px, _ = projection
+                cv2.circle(rgb_vis, center, radius_px, (0, 255, 0), 2)
+                cv2.circle(rgb_vis, center, 5, (0, 0, 255), -1)
+                cv2.putText(rgb_vis, f"Det: {idx}",
+                            (center[0] + 10, center[1] - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
 
         
         # 绘制追踪状态信息
@@ -1203,27 +1249,30 @@ class BallTrackingNode(Node):
         depth_vis = cv2.applyColorMap(depth_normalized, cv2.COLORMAP_JET)
 
         # 在深度可视化上也画出同一 center 有效区域边框，便于对齐观察
-        h_dep, w_dep = depth_vis.shape[:2]
-        border_dep = int(max(0, min(self.center_border_pixels, h_dep // 2, w_dep // 2)))
-        if border_dep > 0:
-            cv2.rectangle(depth_vis, (border_dep, border_dep), (w_dep - border_dep - 1, h_dep - border_dep - 1), (0, 255, 255), 2)
+        x_min, y_min, x_max, y_max = center_valid_bounds(
+            depth_vis.shape, self.center_border_pixels
+        )
+        if x_min < x_max and y_min < y_max:
+            cv2.rectangle(depth_vis, (x_min, y_min), (x_max - 1, y_max - 1), (0, 255, 255), 2)
         
         # 在深度图上绘制检测点
         # detection_results 是 [(pos_body, det_info, ray_info), ...] 格式（body坐标系）
         if detection_results:
-            for idx, (pos_world, det_info, ray_info) in enumerate(detection_results):
-                if det_info is not None and 'center' in det_info:
-                    center = det_info['center']
-                    cv2.circle(depth_vis, center, 5, (0, 0, 255), -1)
-                    
-                    # 显示深度值
-                    cx, cy = center
-                    if 0 <= cy < depth_array.shape[0] and 0 <= cx < depth_array.shape[1]:
-                        depth_val = depth_array[cy, cx]
-                        if np.isfinite(depth_val):
-                            cv2.putText(depth_vis, f"{depth_val:.2f}m", 
-                                      (cx + 10, cy - 10),
-                                      cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            for detection_result in detection_results:
+                projection = self._project_detection_to_left_image(
+                    detection_result, depth_vis.shape
+                )
+                if projection is None:
+                    continue
+
+                center, radius_px, depth_m = projection
+                cv2.circle(depth_vis, center, radius_px, (0, 255, 0), 2)
+                cv2.circle(depth_vis, center, 5, (0, 0, 255), -1)
+
+                cx, cy = center
+                cv2.putText(depth_vis, f"{depth_m:.2f}m",
+                            (cx + 10, cy - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
         
         if self.set_mode == "vertical":
             # 旋转图像（顺时针90度）

@@ -204,8 +204,12 @@ tracker:
   detector:
     # 中心点计算方法
     center_method: "nearest" # "min_depth"
-    # RGB图像四周center无效边框像素宽度（仅用于center校验）
-    center_border_pixels: 40
+    # RGB图像各边center无效区域宽度（仅用于center校验）
+    center_border_pixels:
+      left: 40
+      right: 40
+      top: 40
+      bottom: 40
     # 轮廓检测形状约束（MultiRedBallDetector）
     min_area: 500
     max_area: 9000

@@ -19,7 +19,13 @@ import time
 import yaml
 from pathlib import Path
 import matplotlib.pyplot as plt
-from perception import CameraIntrinsics, BallTracker, BallTrackingVisualizer
+from perception import (
+    CameraIntrinsics,
+    BallTracker,
+    BallTrackingVisualizer,
+    center_valid_bounds,
+    normalize_center_border_pixels,
+)
 import message_filters
 
 
@@ -171,7 +177,9 @@ class BallTrackingNode(Node):
         self.use_robot_data = bool(runtime_cfg.get('use_robot_data', tracker_config.get('use_robot_data', True)))
         self.dt_dynamic = None
         self.ball_tracker = BallTracker(tracker_config=tracker_config)
-        self.center_border_pixels = int(detector_cfg.get('center_border_pixels', tracker_config.get('center_border_pixels', 50)))
+        self.center_border_pixels = normalize_center_border_pixels(
+            detector_cfg.get('center_border_pixels', tracker_config.get('center_border_pixels', 50))
+        )
         self.center_method = detector_cfg.get('center_method', tracker_config.get('center_method', 'min_depth'))
         self.ball_radius = float(detector_cfg.get('ball_radius', tracker_config.get('ball_radius', 0.0375)))
 
@@ -851,19 +859,26 @@ class BallTrackingNode(Node):
                     rgb_to_save = rgb_image.copy()
 
                     # 在带标注图上也绘制 center 有效边框（仅用于center合法性判断）
-                    h_ov, w_ov = rgb_to_save.shape[:2]
-                    border_ov = int(max(0, min(self.center_border_pixels, h_ov // 2, w_ov // 2)))
-                    if border_ov > 0:
+                    x_min, y_min, x_max, y_max = center_valid_bounds(
+                        rgb_to_save.shape, self.center_border_pixels
+                    )
+                    if x_min < x_max and y_min < y_max:
                         cv2.rectangle(
                             rgb_to_save,
-                            (border_ov, border_ov),
-                            (w_ov - border_ov - 1, h_ov - border_ov - 1),
+                            (x_min, y_min),
+                            (x_max - 1, y_max - 1),
                             (0, 255, 255),
                             2,
                         )
                         cv2.putText(
                             rgb_to_save,
-                            f"center valid region (border={border_ov}px)",
+                            (
+                                "center valid region "
+                                f"L{self.center_border_pixels['left']} "
+                                f"R{self.center_border_pixels['right']} "
+                                f"T{self.center_border_pixels['top']} "
+                                f"B{self.center_border_pixels['bottom']}"
+                            ),
                             (10, 22),
                             cv2.FONT_HERSHEY_SIMPLEX,
                             0.5,
@@ -1076,11 +1091,17 @@ class BallTrackingNode(Node):
         rgb_vis = rgb_bgr.copy()
 
         # 绘制 center 无效边框（仅用于center合法性判断，不屏蔽检测）
-        h_rgb, w_rgb = rgb_vis.shape[:2]
-        border = int(max(0, min(self.center_border_pixels, h_rgb // 2, w_rgb // 2)))
-        if border > 0:
-            cv2.rectangle(rgb_vis, (border, border), (w_rgb - border - 1, h_rgb - border - 1), (0, 255, 255), 2)
-            cv2.putText(rgb_vis, f"center valid region (border={border}px)",
+        x_min, y_min, x_max, y_max = center_valid_bounds(
+            rgb_vis.shape, self.center_border_pixels
+        )
+        if x_min < x_max and y_min < y_max:
+            cv2.rectangle(rgb_vis, (x_min, y_min), (x_max - 1, y_max - 1), (0, 255, 255), 2)
+            cv2.putText(rgb_vis,
+                        "center valid region "
+                        f"L{self.center_border_pixels['left']} "
+                        f"R{self.center_border_pixels['right']} "
+                        f"T{self.center_border_pixels['top']} "
+                        f"B{self.center_border_pixels['bottom']}",
                         (10, 22),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
         
@@ -1163,10 +1184,11 @@ class BallTrackingNode(Node):
         depth_vis = cv2.applyColorMap(depth_normalized, cv2.COLORMAP_JET)
 
         # 在深度可视化上也画出同一 center 有效区域边框，便于对齐观察
-        h_dep, w_dep = depth_vis.shape[:2]
-        border_dep = int(max(0, min(self.center_border_pixels, h_dep // 2, w_dep // 2)))
-        if border_dep > 0:
-            cv2.rectangle(depth_vis, (border_dep, border_dep), (w_dep - border_dep - 1, h_dep - border_dep - 1), (0, 255, 255), 2)
+        x_min, y_min, x_max, y_max = center_valid_bounds(
+            depth_vis.shape, self.center_border_pixels
+        )
+        if x_min < x_max and y_min < y_max:
+            cv2.rectangle(depth_vis, (x_min, y_min), (x_max - 1, y_max - 1), (0, 255, 255), 2)
         
         # 在深度图上绘制检测点
         # detection_results 是 [(pos_body, det_info, ray_info), ...] 格式（body坐标系）
