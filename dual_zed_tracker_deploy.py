@@ -184,7 +184,11 @@ class BallTrackingNode(Node):
         self.dt = float(runtime_cfg.get('dt', tracker_config.get('dt', 1.0 / 60.0)))
         self.use_robot_data = bool(runtime_cfg.get('use_robot_data', tracker_config.get('use_robot_data', True)))
         self.dt_dynamic = None
-        self.ball_tracker = BallTracker(tracker_config=tracker_config)
+        dual_camera_extrinsics = config['extrinsics']['dual cameras']
+        self.ball_tracker = BallTracker(
+            tracker_config=tracker_config,
+            dual_camera_extrinsics=dual_camera_extrinsics,
+        )
         self.center_border_pixels = normalize_center_border_pixels(
             detector_cfg.get('center_border_pixels', tracker_config.get('center_border_pixels', 50))
         )

@@ -4,6 +4,34 @@ import cv2
 from scipy.optimize import linear_sum_assignment
 
 
+def compute_camera_frame_transform(source_extrinsics, target_extrinsics):
+    """Compute the rigid transform from a source camera frame to a target camera frame.
+
+    Each extrinsics mapping follows Tracker_config.yaml:
+        point_body = rotation @ point_camera + position
+
+    Returns:
+        rotation_target_from_source, translation_target_from_source
+    """
+    source_position = np.asarray(source_extrinsics['position'], dtype=np.float64).reshape(3)
+    source_rotation = np.asarray(source_extrinsics['rotation'], dtype=np.float64).reshape(3, 3)
+    target_position = np.asarray(target_extrinsics['position'], dtype=np.float64).reshape(3)
+    target_rotation = np.asarray(target_extrinsics['rotation'], dtype=np.float64).reshape(3, 3)
+
+    values = (source_position, source_rotation, target_position, target_rotation)
+    if not all(np.all(np.isfinite(value)) for value in values):
+        raise ValueError("Camera extrinsics must contain only finite values")
+    if abs(np.linalg.det(source_rotation)) < 1e-8 or abs(np.linalg.det(target_rotation)) < 1e-8:
+        raise ValueError("Camera extrinsics rotation matrix must be invertible")
+
+    rotation_target_from_source = np.linalg.solve(target_rotation, source_rotation)
+    translation_target_from_source = np.linalg.solve(
+        target_rotation,
+        source_position - target_position,
+    )
+    return rotation_target_from_source, translation_target_from_source
+
+
 class CameraIntrinsics:
     """相机内参"""
     
@@ -2304,12 +2332,13 @@ class BallTracker:
     - w_history: 历史一致性权重（默认0.2）
     """
     
-    def __init__(self, tracker_config=None):
+    def __init__(self, tracker_config=None, dual_camera_extrinsics=None):
         """
         初始化多球追踪器
         
         Args:
             tracker_config: tracker参数字典（所有参数从此字典解析）
+            dual_camera_extrinsics: 双相机外参，包含left和right的position/rotation
         """
         cfg = tracker_config or {}
 
@@ -2361,6 +2390,22 @@ class BallTracker:
 
         # 创建球检测器
         self.detector = MultiRedBallDetector(detector_config=detector_cfg)
+
+        self.right_to_left_rotation = None
+        self.right_to_left_translation = None
+        if dual_camera_extrinsics is not None:
+            try:
+                right_extrinsics = dual_camera_extrinsics['right']
+                left_extrinsics = dual_camera_extrinsics['left']
+            except (KeyError, TypeError) as exc:
+                raise ValueError(
+                    "dual_camera_extrinsics must contain left and right camera extrinsics"
+                ) from exc
+
+            (
+                self.right_to_left_rotation,
+                self.right_to_left_translation,
+            ) = compute_camera_frame_transform(right_extrinsics, left_extrinsics)
 
         # 为每个球创建独立的卡尔曼滤波器
         self.kf_filters = [
@@ -3013,13 +3058,23 @@ class BallTracker:
                     rgb, depth, camera_intrinsics, center_method=center_method, ball_radius=ball_radius
                 )
                 for_comparing_results.append(single_results)
-            # 双相机竖直平行放置，相机坐标系y方向相距15cm,将右侧相机的点云向左平移15cm，统一以左侧相机坐标系为基准
+            if self.right_to_left_rotation is None or self.right_to_left_translation is None:
+                raise ValueError(
+                    "Dual-camera detection requires left/right extrinsics from Tracker_config.yaml"
+                )
+
+            # 将右相机点云完整变换到左相机坐标系，统一以左相机为融合基准。
             for det, ray_info in for_comparing_results[1]:
-                ray_info['point_cam'][1] -= 0.15
+                right_point = np.asarray(ray_info['point_cam'], dtype=np.float64).reshape(3)
+                ray_info['point_cam'] = (
+                    self.right_to_left_rotation @ right_point
+                    + self.right_to_left_translation
+                )
 
                 point_cam = ray_info['point_cam']
-                ray_info['ray_direction'] = point_cam / np.linalg.norm(point_cam)
-                ray_info['actual_ray_length'] = np.linalg.norm(point_cam)
+                point_length = np.linalg.norm(point_cam)
+                ray_info['ray_direction'] = point_cam / point_length
+                ray_info['actual_ray_length'] = point_length
 
             # 左右结果融合
             left_results = for_comparing_results[0]
